@@ -1,13 +1,29 @@
 import re
-from collections import defaultdict
+from collections import defaultdict, Counter
 from typing import Dict, List, Any
+from pathlib import Path
+import sys, os
 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.solver import get_role_counts
 
 ROLE_KEYWORDS = {
     "Seer": ["Seer", "seer", "占", "占卜", "prophecy", "prophet"],
     "Medium": ["Medium", "medium", "霊", "靈", "驗屍"],
     "Hunter": ["Hunter", "hunter", "guard", "protect"],
 }
+
+
+def get_seer_claimers_from_claims(claims: Dict[str, List[Dict[str, Any]]]) -> List[str]:
+    out = []
+    for player, cs in claims.items():
+        for c in cs:
+            name = claim_name(c)
+            if name == "Seer CO":
+                out.append(player)
+    return list(dict.fromkeys(out))
+
 
 def parse_messages(day_text: str) -> List[Dict[str, Any]]:
     """
@@ -50,26 +66,50 @@ def extract_claims_from_messages(messages: List[Dict[str, Any]], players: List[s
     claims = defaultdict(list)
     player_set = set(players)
 
+    # Only first-person / explicit bracket-style self claims.
+    # Do NOT match generic "Seer claim" because that often means discussing someone else's claim.
     seer_pat = re.compile(
-        r"(Seer claim|\[Seer\]|\bI'?m a Seer\b|\bI am the Seer\b|"
-        r"占CO|占いCO|占い師|【占】|占いです)",
+        r"(\[Seer claim\]|\[Seer\]\s*:|"
+        r"\bI'?m a Seer\b|\bI am a Seer\b|\bI am the Seer\b|\bI'?m the Seer\b|"
+        r"\bI claim Seer\b|\bI'?ll claim Seer\b|"
+        r"占CO|占いCO|【占】|占いです|占い師CO)",
         re.I,
     )
 
     medium_pat = re.compile(
-        r"(Medium Claim|\[Medium\]|\bI'?m the Medium\b|\bI am the Medium\b|"
-        r"霊CO|霊能CO|霊媒CO|【霊】|霊能者)",
+        r"(\[Medium claim\]|\[Medium\]\s*:|"
+        r"\bI'?m a Medium\b|\bI am a Medium\b|\bI am the Medium\b|\bI'?m the Medium\b|"
+        r"\bI claim Medium\b|\bI'?ll claim Medium\b|"
+        r"霊CO|霊能CO|霊媒CO|【霊】|霊能者CO)",
         re.I,
     )
 
     not_both_pat = re.compile(
         r"(not Seer\s*/\s*not Medium|neither a Seer nor a Medium|"
-        r"not a Seer or Medium|非占非霊|非占霊|非占.*非霊|非霊.*非占)",
+        r"not a Seer or Medium|not Seer and not Medium|"
+        r"非占非霊|非占霊|非占.*非霊|非霊.*非占)",
         re.I,
     )
 
-    not_seer_pat = re.compile(r"(not Seer|非占)", re.I)
-    not_medium_pat = re.compile(r"(not Medium|非霊)", re.I)
+    not_seer_pat = re.compile(
+        r"(\bnot Seer\b|\bnot a Seer\b|\bI am not the Seer\b|非占)",
+        re.I,
+    )
+
+    not_medium_pat = re.compile(
+        r"(\bnot Medium\b|\bnot a Medium\b|\bI am not the Medium\b|非霊)",
+        re.I,
+    )
+
+    # Phrases that indicate discussion of claims, not self-claim.
+    discussion_only_pat = re.compile(
+        r"(made a Seer claim|made a Medium claim|"
+        r"someone.*Seer claim|someone.*Medium claim|"
+        r"seer claim order|medium claim order|"
+        r"other.*Seer claim|other.*Medium claim|"
+        r"if .* Seer claim|if .* Medium claim)",
+        re.I,
+    )
 
     for msg in messages:
         speaker = msg["speaker"]
@@ -78,23 +118,12 @@ def extract_claims_from_messages(messages: List[Dict[str, Any]], players: List[s
         if speaker not in player_set:
             continue
 
-        if seer_pat.search(text):
-            claims[speaker].append({
-                "claim": "Seer CO",
-                "order": msg["no"],
-                "time": msg["time"],
-                "text": text[:300],
-            })
+        # Self-denial should be extracted first.
+        has_not_both = bool(not_both_pat.search(text))
+        has_not_seer = bool(not_seer_pat.search(text))
+        has_not_medium = bool(not_medium_pat.search(text))
 
-        if medium_pat.search(text):
-            claims[speaker].append({
-                "claim": "Medium CO",
-                "order": msg["no"],
-                "time": msg["time"],
-                "text": text[:300],
-            })
-
-        if not_both_pat.search(text):
+        if has_not_both:
             claims[speaker].append({
                 "claim": "Not Seer/Medium",
                 "order": msg["no"],
@@ -102,16 +131,42 @@ def extract_claims_from_messages(messages: List[Dict[str, Any]], players: List[s
                 "text": text[:300],
             })
         else:
-            if not_seer_pat.search(text):
+            if has_not_seer:
                 claims[speaker].append({
                     "claim": "Not Seer",
                     "order": msg["no"],
                     "time": msg["time"],
                     "text": text[:300],
                 })
-            if not_medium_pat.search(text):
+            if has_not_medium:
                 claims[speaker].append({
                     "claim": "Not Medium",
+                    "order": msg["no"],
+                    "time": msg["time"],
+                    "text": text[:300],
+                })
+
+        # If the text is clearly discussing someone else's claim and does not use
+        # a strong bracket/first-person self-claim, skip role CO.
+        discussion_only = bool(discussion_only_pat.search(text))
+
+        seer_match = bool(seer_pat.search(text))
+        medium_match = bool(medium_pat.search(text))
+
+        if seer_match and not (discussion_only and not re.search(r"(\[Seer claim\]|\[Seer\]\s*:|占CO|占いCO|【占】)", text, re.I)):
+            # Avoid contradictory extraction from the same sentence unless there is an explicit bracket claim.
+            if not has_not_both or re.search(r"(\[Seer claim\]|\[Seer\]\s*:|占CO|占いCO|【占】)", text, re.I):
+                claims[speaker].append({
+                    "claim": "Seer CO",
+                    "order": msg["no"],
+                    "time": msg["time"],
+                    "text": text[:300],
+                })
+
+        if medium_match and not (discussion_only and not re.search(r"(\[Medium claim\]|\[Medium\]\s*:|霊CO|霊能CO|霊媒CO|【霊】)", text, re.I)):
+            if not has_not_both or re.search(r"(\[Medium claim\]|\[Medium\]\s*:|霊CO|霊能CO|霊媒CO|【霊】)", text, re.I):
+                claims[speaker].append({
+                    "claim": "Medium CO",
                     "order": msg["no"],
                     "time": msg["time"],
                     "text": text[:300],
@@ -145,23 +200,25 @@ def split_days(text: str) -> Dict[str, str]:
     return days
 
 
-def extract_deaths(day_text: str) -> List[str]:
+def extract_deaths(day_text: str, players: List[str]) -> List[str]:
     deaths = []
 
-    patterns = [
-        r"(.+?) was found in a gruesome state",
-        r"The next morning, (.+?) was found",
-        r"(.+?) was executed",
-        r"(.+?) died from sudden death",
-        r"(.+?) suddenly died",
-        r"(.+?) died",
-    ]
+    for p in players:
+        escaped = re.escape(p)
 
-    for pat in patterns:
-        for m in re.finditer(pat, day_text):
-            name = clean_name(m.group(1))
-            if name:
-                deaths.append(name)
+        patterns = [
+            rf"\b{escaped}\b was found in a gruesome state",
+            rf"The next morning,\s*\b{escaped}\b was found",
+            rf"\b{escaped}\b was executed",
+            rf"\b{escaped}\b died from sudden death",
+            rf"\b{escaped}\b suddenly died",
+            rf"\b{escaped}\b died",
+        ]
+
+        for pat in patterns:
+            if re.search(pat, day_text, re.I):
+                deaths.append(p)
+                break
 
     return list(dict.fromkeys(deaths))
 
@@ -193,78 +250,72 @@ def extract_claims(day_text: str, players: List[str]) -> Dict[str, List[str]]:
     return dict(claims)
 
 
-def extract_divinations(day_text: str, players: List[str]) -> List[Dict[str, str]]:
-    """
-    Extract hard Seer-like results only.
-    Conservative by design.
-
-    white/black are treated as hard result only when near:
-    - result
-    - verdict
-    - divination
-    - check
-    - says
-    - is human / is werewolf
-    """
+def extract_divinations_from_messages(
+    messages: List[Dict[str, Any]],
+    players: List[str],
+    seer_claimers: List[str],
+) -> List[Dict[str, Any]]:
     results = []
+    player_set = set(players)
+    seer_set = set(seer_claimers)
 
-    result_words = {
-        "human": "human",
-        "werewolf": "werewolf",
-        "white": "human",
-        "black": "werewolf",
-    }
+    result_patterns = [
+        # English translated logs
+        (r"(?:result|verdict|divination|check|checked|announce|announces).*?{target}.*?\b(human|werewolf|white|black)\b", 1),
+        (r"{target}.*?\b(is|was)\s+(human|a human|werewolf|a werewolf)\b", 2),
 
-    result_context = r"(result|verdict|divination|divined|check|checked|says|announces|判定|占|占卜|結果)"
+        # Japanese / mixed forms, in case untranslated fragments remain
+        (r"{target}.*?(白|黒|黑|人間|狼|人狼)", 1),
+    ]
 
-    for seer in players:
+    for msg in messages:
+        speaker = msg["speaker"]
+        text = msg["text"]
+
+        if speaker not in seer_set:
+            continue
+
+        # Avoid extracting ordinary discussion as hard result.
+        if not re.search(
+            r"(result|verdict|divination|divined|check|checked|announce|announces|判定|結果|占い結果|占結果)",
+            text,
+            re.I,
+        ):
+            continue
+
         for target in players:
-            if seer == target:
+            if target == speaker:
                 continue
 
-            patterns = [
-                # Seer ... result/check/divination ... Target ... human/werewolf/white/black
-                rf"{re.escape(seer)}[\s\S]{{0,250}}{result_context}[\s\S]{{0,150}}{re.escape(target)}[\s\S]{{0,80}}\b(human|werewolf|white|black)\b",
+            escaped = re.escape(target)
+            for raw_pat, group_idx in result_patterns:
+                pat = raw_pat.format(target=escaped)
+                m = re.search(pat, text, re.I)
+                if not m:
+                    continue
 
-                # Seer ... Target ... is human/werewolf
-                # Keep white/black here only if "result/check/verdict" also appears nearby.
-                rf"{re.escape(seer)}[\s\S]{{0,250}}{re.escape(target)}[\s\S]{{0,50}}\b(is|was)\s+(human|a human|werewolf|a werewolf)\b",
+                word = m.group(group_idx).lower()
+                if word in ("human", "a human", "white", "白", "人間"):
+                    result = "human"
+                elif word in ("werewolf", "a werewolf", "black", "黒", "黑", "狼", "人狼"):
+                    result = "werewolf"
+                else:
+                    continue
 
-                # Seer ... Target ... white/black result
-                rf"{re.escape(seer)}[\s\S]{{0,250}}{re.escape(target)}[\s\S]{{0,50}}\b(white|black)\s+(result|verdict)\b",
-
-                # Target ... human/werewolf by Seer
-                rf"{re.escape(target)}[\s\S]{{0,50}}\b(human|werewolf)\b[\s\S]{{0,120}}\bby\b[\s\S]{{0,50}}{re.escape(seer)}",
-            ]
-
-            for pat in patterns:
-                for m in re.finditer(pat, day_text, re.I):
-                    groups = [g for g in m.groups() if g]
-                    word = None
-                    for g in reversed(groups):
-                        g = g.lower().strip()
-                        if g in result_words:
-                            word = g
-                            break
-                        if g in ["a human"]:
-                            word = "human"
-                            break
-                        if g in ["a werewolf"]:
-                            word = "werewolf"
-                            break
-
-                    if word:
-                        results.append({
-                            "seer": seer,
-                            "target": target,
-                            "result": result_words[word],
-                            "evidence_type": "hard_divination",
-                        })
+                results.append({
+                    "seer": speaker,
+                    "target": target,
+                    "result": result,
+                    "order": msg["no"],
+                    "time": msg["time"],
+                    "text": text[:250],
+                    "evidence_type": "hard_divination",
+                })
 
     seen = set()
     unique = []
     for r in results:
-        key = (r["seer"], r["target"], r["result"])
+        key = (r["seer"], r["target"], r["result"], r.get("order"))
         if key not in seen:
             seen.add(key)
             unique.append(r)
@@ -318,6 +369,7 @@ def extract_soft_reads(day_text: str, players: List[str]) -> List[Dict[str, str]
                             "read": read_words[word],
                             "raw_word": word,
                             "evidence_type": "soft_read",
+                            "text": day_text[max(0, m.start() - 80): min(len(day_text), m.end() + 80)],
                         })
 
     seen = set()
@@ -409,17 +461,24 @@ def parse_game_log(text: str, players: List[str]) -> Dict[str, Any]:
             claims = extract_claims_from_messages(messages, players)
             votes = extract_votes_from_messages(messages, players)
 
-            # divination / soft read 可以先沿用舊的全文 regex，下一步再改
-            divinations = extract_divinations(content, players)
+            seer_claimers = get_seer_claimers_from_claims(claims)
+            divinations = extract_divinations_from_messages(
+                messages=messages,
+                players=players,
+                seer_claimers=seer_claimers,
+            )
             soft_reads = extract_soft_reads(content, players)
         else:
             claims = extract_claims(content, players)
             votes = extract_votes(content, players)
-            divinations = extract_divinations(content, players)
+
+            # No reliable message structure, so avoid extracting hard divination.
+            # This prevents false hard results from long raw-text regex.
+            divinations = []
             soft_reads = extract_soft_reads(content, players)
 
         if str(day).isdigit() and int(day) >= 2:
-            deaths = extract_deaths(content)
+            deaths = extract_deaths(content, players)
         else:
             deaths = []
 
@@ -617,3 +676,236 @@ def build_evidence_cards(parsed: Dict[str, Any], players: List[str]) -> Dict[str
                 evidence[d]["summary"]["death_or_status"].append(item)
 
     return evidence
+
+
+def _claim_value(c: Any) -> str:
+    if isinstance(c, dict):
+        return str(c.get("claim", ""))
+    return str(c)
+
+
+def _sort_days(days: Dict[str, Any]) -> List[str]:
+    def key(d: str):
+        s = str(d)
+        if s == "prologue":
+            return (-1, 0)
+        if s.isdigit():
+            return (0, int(s))
+        return (1, s)
+
+    return sorted(days.keys(), key=key)
+
+
+def _unique_keep_order(xs: List[str]) -> List[str]:
+    return list(dict.fromkeys(xs))
+
+
+def _summarize_vote_targets(votes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Split ●/○ seer preferences and ▼/▽ execution preferences.
+    """
+    seer_first = Counter()
+    seer_second = Counter()
+    exe_first = Counter()
+    exe_second = Counter()
+
+    for v in votes:
+        target = v.get("target")
+        vote_type = v.get("type", "")
+        if not target:
+            continue
+
+        if vote_type == "seer_first_preference":
+            seer_first[target] += 1
+        elif vote_type == "seer_second_preference":
+            seer_second[target] += 1
+        elif vote_type == "execution_first_preference":
+            exe_first[target] += 1
+        elif vote_type == "execution_second_preference":
+            exe_second[target] += 1
+        elif vote_type == "preference":
+            # fallback extractor does not distinguish ●/▼
+            seer_first[target] += 1
+
+    return {
+        "seer_first": dict(seer_first.most_common()),
+        "seer_second": dict(seer_second.most_common()),
+        "execution_first": dict(exe_first.most_common()),
+        "execution_second": dict(exe_second.most_common()),
+        "top_seer_targets": [p for p, _ in seer_first.most_common(5)],
+        "top_execution_targets": [p for p, _ in exe_first.most_common(5)],
+    }
+
+
+def _summarize_soft_reads(reads: List[Dict[str, Any]]) -> Dict[str, Any]:
+    wolfish = Counter()
+    villagery = Counter()
+
+    for r in reads:
+        target = r.get("target")
+        read = r.get("read")
+        if not target:
+            continue
+
+        if read == "likely_werewolf":
+            wolfish[target] += 1
+        elif read == "likely_villager":
+            villagery[target] += 1
+
+    return {
+        "likely_werewolf_counts": dict(wolfish.most_common()),
+        "likely_villager_counts": dict(villagery.most_common()),
+        "top_suspected_players": [p for p, _ in wolfish.most_common(5)],
+        "top_villagery_players": [p for p, _ in villagery.most_common(5)],
+    }
+
+
+def build_daily_states(parsed: Dict[str, Any], players: List[str]) -> Dict[str, Any]:
+    """
+    Build cumulative board states after each day.
+
+    This is not a final inference result. It is a structured board-state summary
+    for downstream agents:
+    - formation
+    - claimers
+    - gray players
+    - hard divination results
+    - vote pressure
+    - soft suspicion concentration
+    """
+    states: Dict[str, Any] = {}
+
+    alive = set(players)
+    dead = set()
+
+    cumulative_claims: Dict[str, List[Any]] = defaultdict(list)
+    cumulative_divinations: List[Dict[str, Any]] = []
+    cumulative_votes: List[Dict[str, Any]] = []
+    cumulative_soft_reads: List[Dict[str, Any]] = []
+    cumulative_deaths: List[str] = []
+
+    role_counts = get_role_counts(len(players))
+
+    for day in _sort_days(parsed.get("days", {})):
+        day_obj = parsed["days"][day]
+
+        # 1. Accumulate daily events.
+        for p, claims in day_obj.get("claims", {}).items():
+            cumulative_claims[p].extend(claims)
+
+        cumulative_divinations.extend(day_obj.get("divinations", []))
+        cumulative_votes.extend(day_obj.get("votes", []))
+        cumulative_soft_reads.extend(day_obj.get("soft_reads", []))
+
+        for d in day_obj.get("deaths", []):
+            if d in players:
+                dead.add(d)
+                alive.discard(d)
+                cumulative_deaths.append(d)
+
+        # 2. Current claimers.
+        seer_claimers = []
+        medium_claimers = []
+        not_seer_medium = []
+
+        for p, cs in cumulative_claims.items():
+            claim_names = [_claim_value(c) for c in cs]
+
+            if "Seer CO" in claim_names:
+                seer_claimers.append(p)
+            if "Medium CO" in claim_names:
+                medium_claimers.append(p)
+            if "Not Seer/Medium" in claim_names or (
+                "Not Seer" in claim_names and "Not Medium" in claim_names
+            ):
+                not_seer_medium.append(p)
+
+        seer_claimers = _unique_keep_order(seer_claimers)
+        medium_claimers = _unique_keep_order(medium_claimers)
+        not_seer_medium = _unique_keep_order(not_seer_medium)
+
+        ability_claimers = set(seer_claimers) | set(medium_claimers)
+
+        gray_players = [
+            p for p in players
+            if p in alive and p not in ability_claimers
+        ]
+
+        # 3. Hard divination facts.
+        hard_white_results = [
+            r for r in cumulative_divinations
+            if isinstance(r, dict) and r.get("result") == "human"
+        ]
+        hard_black_results = [
+            r for r in cumulative_divinations
+            if isinstance(r, dict) and r.get("result") == "werewolf"
+        ]
+
+        hard_white_targets = _unique_keep_order([
+            r.get("target") for r in hard_white_results if r.get("target") in players
+        ])
+        hard_black_targets = _unique_keep_order([
+            r.get("target") for r in hard_black_results if r.get("target") in players
+        ])
+
+        # 4. Vote/read summaries.
+        day_vote_summary = _summarize_vote_targets(day_obj.get("votes", []))
+        cumulative_vote_summary = _summarize_vote_targets(cumulative_votes)
+
+        day_soft_summary = _summarize_soft_reads(day_obj.get("soft_reads", []))
+        cumulative_soft_summary = _summarize_soft_reads(cumulative_soft_reads)
+
+        # 5. Useful derived facts for downstream agents.
+        if len(seer_claimers) == 0 and len(medium_claimers) == 0:
+            formation_type = "no_claims_or_pre_claim"
+        elif len(seer_claimers) >= 2 or len(medium_claimers) >= 2:
+            formation_type = "contested_abilities"
+        else:
+            formation_type = "mostly_uncontested_abilities"
+
+        likely_gray_wolf_slots = max(
+            0,
+            role_counts["Werewolf"] - min(role_counts["Werewolf"], len(ability_claimers))
+        )
+
+        states[day] = {
+            "day": day,
+            "alive_players": sorted(alive),
+            "dead_players": sorted(dead),
+            "role_counts": role_counts,
+
+            "seer_claimers": seer_claimers,
+            "medium_claimers": medium_claimers,
+            "not_seer_medium_claimers": not_seer_medium,
+            "formation": f"{len(seer_claimers)}-{len(medium_claimers)}",
+            "formation_type": formation_type,
+
+            "ability_claimers": sorted(ability_claimers),
+            "gray_players": gray_players,
+            "likely_gray_wolf_slots_upper_bound": likely_gray_wolf_slots,
+
+            "hard_white_results": hard_white_results,
+            "hard_black_results": hard_black_results,
+            "hard_white_targets": hard_white_targets,
+            "hard_black_targets": hard_black_targets,
+
+            "day_vote_summary": day_vote_summary,
+            "cumulative_vote_summary": cumulative_vote_summary,
+
+            "day_soft_read_summary": day_soft_summary,
+            "cumulative_soft_read_summary": cumulative_soft_summary,
+
+            "top_suspected_players": cumulative_soft_summary["top_suspected_players"],
+            "top_execution_targets": cumulative_vote_summary["top_execution_targets"],
+            "top_seer_targets": cumulative_vote_summary["top_seer_targets"],
+
+            "deaths_so_far": _unique_keep_order(cumulative_deaths),
+
+            "notes": [
+                "Hard white means Seer human result, not confirmed Villager.",
+                "Soft reads are ordinary discussion reads, not hard role results.",
+                "Gray players exclude current Seer/Medium claimers but may include Hunter, Villager, Madman, or Werewolf.",
+            ],
+        }
+
+    return states

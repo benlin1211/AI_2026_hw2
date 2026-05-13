@@ -6,24 +6,6 @@ This system predicts each character's role and wolf_score from Werewolf game log
 
 The system uses a multi-agent pipeline:
 
-1. Event extraction agent
-   - Parses daily logs.
-   - Extracts claims, divination results, votes, deaths, and panda states.
-
-2. Role reasoning agent
-   - Uses a local LLM to estimate role probabilities.
-
-3. Wolf reasoning agent
-   - Uses a local LLM to estimate continuous wolf_score.
-
-4. Constrained solver
-   - Assigns roles under fixed role counts:
-     - 3 Werewolves
-     - 1 Seer
-     - 1 Medium
-     - 1 Madman
-     - 1 Hunter
-     - remaining Villagers
 ```
 hw2_<student-id>/
 ├── main.py

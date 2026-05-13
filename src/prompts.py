@@ -1,328 +1,304 @@
 import json
+from typing import Any, Dict, List, Optional
 
 
-def _compact_evidence_for_prompt(evidence_cards, max_chars=18000):
-    """
-    Keep global card and each player's summary.
-    Avoid dumping full by_day unless needed.
-    """
-    compact = {}
-
-    if isinstance(evidence_cards, dict) and "_global" in evidence_cards:
-        compact["_global"] = evidence_cards["_global"]
-
-    players_compact = {}
-    if isinstance(evidence_cards, dict):
-        for k, v in evidence_cards.items():
-            if k == "_global":
-                continue
-            if isinstance(v, dict):
-                players_compact[k] = {
-                    "summary": v.get("summary", {}),
-                    # Keep by_day small. This helps timing but avoids exploding context.
-                    "by_day_keys": list(v.get("by_day", {}).keys()),
-                }
-
-    compact["players"] = players_compact
-    return _short_json(compact, max_chars=max_chars)
+ROLE_NAMES = ["Villager", "Werewolf", "Seer", "Medium", "Madman", "Hunter"]
 
 
-def _short_json(obj, max_chars=12000):
-    """
-    Convert object to compact JSON string and truncate if needed.
-    Prefer keeping the tail because later game states often contain final claims/votes.
-    """
+def _players_text(players: List[str]) -> str:
+    return "\n".join(f"- {p}" for p in players)
+
+
+def _short_json(obj: Any, max_chars: int = 12000) -> str:
     try:
         s = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
     except Exception:
         s = str(obj)
-
     if len(s) <= max_chars:
         return s
-
-    return s[-max_chars:]
-
-
-def _players_text(players):
-    return "\n".join(f"- {p}" for p in players)
+    # Keep head and tail instead of tail only.  CO formation is usually early;
+    # vote/result pressure is often late.
+    half = max_chars // 2
+    return s[:half] + "\n...TRUNCATED_MIDDLE...\n" + s[-half:]
 
 
-def build_role_prompt(players, evidence_cards, parsed):
-    players_text = _players_text(players)
+def _claim_name(c: Any) -> str:
+    if isinstance(c, dict):
+        return str(c.get("claim", ""))
+    return str(c)
 
-    evidence_text = _compact_evidence_for_prompt(evidence_cards, max_chars=18000)
 
-    parsed_compact = {
-        "global": evidence_cards.get("_global", {}) if isinstance(evidence_cards, dict) else {},
-        "deaths": parsed.get("deaths", []),
-        "all_divinations": parsed.get("all_divinations", []),
-        "all_votes": parsed.get("all_votes", [])[:200],
+def _role_counts(num_players: int) -> Dict[str, int]:
+    return {
+        "Werewolf": 3 if num_players >= 13 else 2,
+        "Seer": 1,
+        "Medium": 1,
+        "Madman": 1 if num_players >= 11 else 0,
+        "Hunter": 1 if num_players >= 11 else 0,
+        "Villager": max(0, num_players - (3 if num_players >= 13 else 2) - 1 - 1 - (1 if num_players >= 11 else 0) - (1 if num_players >= 11 else 0)),
     }
-    parsed_text = _short_json(parsed_compact, max_chars=8000)
 
-    prompt = f"""
-You are a role probability estimator for a Werewolf game.
 
-Return exactly one JSON object.
-No markdown. No explanation.
+def _compact_claims(parsed: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for p, claims in parsed.get("all_claims", {}).items():
+        rows = []
+        for c in claims if isinstance(claims, list) else []:
+            if isinstance(c, dict):
+                rows.append({
+                    "claim": c.get("claim"),
+                    "day": c.get("day"),
+                    "order": c.get("order"),
+                    "time": c.get("time"),
+                    "text": str(c.get("text", ""))[:240],
+                })
+            else:
+                rows.append({"claim": str(c)})
+        if rows:
+            out[p] = rows
+    return out
+
+
+def _important_text(text: str) -> bool:
+    keys = [
+        "Seer", "Medium", "not Seer", "not Medium", "claim", "CO",
+        "result", "verdict", "divination", "checked", "human", "werewolf",
+        "white", "black", "gray", "wolf", "lynch", "execute", "vote",
+        "●", "○", "▼", "▽", "占", "霊", "靈", "判定", "結果", "白", "黒", "狼",
+    ]
+    low = text.lower()
+    return any(k.lower() in low for k in keys)
+
+
+def _strategic_timeline(parsed: Dict[str, Any], max_early: int = 70, max_late: int = 70) -> List[Dict[str, Any]]:
+    events = []
+    for msg in parsed.get("messages", []):
+        text = str(msg.get("text", ""))
+        if _important_text(text):
+            events.append({
+                "day": msg.get("day"),
+                "order": msg.get("no"),
+                "time": msg.get("time"),
+                "speaker": msg.get("speaker"),
+                "text": text[:420],
+            })
+    if len(events) <= max_early + max_late:
+        return events
+    return events[:max_early] + [{"note": "middle strategic timeline omitted"}] + events[-max_late:]
+
+
+def _compact_daily_states(daily_states: Optional[Dict[str, Any]], max_days: int = 10) -> Dict[str, Any]:
+    if not isinstance(daily_states, dict):
+        return {}
+    out = {}
+    for day in list(daily_states.keys())[-max_days:]:
+        s = daily_states.get(day, {})
+        if not isinstance(s, dict):
+            continue
+        out[day] = {
+            "alive_players": s.get("alive_players", []),
+            "dead_players": s.get("dead_players", []),
+            "role_counts": s.get("role_counts", {}),
+            "formation": s.get("formation"),
+            "formation_type": s.get("formation_type"),
+            "seer_claimers": s.get("seer_claimers", []),
+            "medium_claimers": s.get("medium_claimers", []),
+            "not_seer_medium_claimers": s.get("not_seer_medium_claimers", []),
+            "gray_players": s.get("gray_players", []),
+            "hard_white_targets": s.get("hard_white_targets", []),
+            "hard_black_targets": s.get("hard_black_targets", []),
+            "top_suspected_players": s.get("top_suspected_players", []),
+            "top_execution_targets": s.get("top_execution_targets", []),
+            "top_seer_targets": s.get("top_seer_targets", []),
+            "cumulative_vote_summary": s.get("cumulative_vote_summary", {}),
+            "cumulative_soft_read_summary": s.get("cumulative_soft_read_summary", {}),
+        }
+    return out
+
+
+def _player_summaries(evidence_cards: Dict[str, Any], players: List[str]) -> Dict[str, Any]:
+    out = {}
+    if not isinstance(evidence_cards, dict):
+        return out
+    for p in players:
+        card = evidence_cards.get(p, {})
+        if isinstance(card, dict):
+            out[p] = card.get("summary", card)
+        else:
+            out[p] = str(card)[:800]
+    return out
+
+
+def _compact_context(players, evidence_cards, parsed, daily_states, formation_analysis, max_chars=26000) -> str:
+    ctx = {
+        "role_counts": _role_counts(len(players)),
+        "global": evidence_cards.get("_global", {}) if isinstance(evidence_cards, dict) else {},
+        "formation_analysis": formation_analysis or {},
+        "daily_states": _compact_daily_states(daily_states),
+        "claims_with_quotes": _compact_claims(parsed),
+        "hard_divinations": parsed.get("all_divinations", []),
+        "votes": parsed.get("all_votes", [])[:260],
+        "deaths": parsed.get("deaths", []),
+        "strategic_timeline": _strategic_timeline(parsed),
+        "players": _player_summaries(evidence_cards, players),
+    }
+    return _short_json(ctx, max_chars=max_chars)
+
+
+COMMON_RULES = """
+Game rules and scoring-relevant facts:
+- There is exactly 1 true Seer and 1 true Medium.
+- Werewolf count is 2 for up to 12 players and 3 for 13+ players.
+- Madman and Hunter exist only in 11+ player games.
+- Madman is human, wolf-aligned, and does not know the Werewolves. Seer/Medium results on Madman are human.
+- Hunter is human and usually hides; do not infer Hunter from generic town-like behavior.
+- white/black in ordinary discussion are soft reads, not hard divination results.
+- Treat white/black as hard results only when the text explicitly says result, verdict, divination, check, announce, role report, 判定, 結果, 占い結果.
+- A fake Seer or fake Medium is often Werewolf or Madman, not Villager/Hunter.
+- In contested 2-2 formations, usually separate ability claimers from gray players; do not put all wolf probability only on claimers.
+- For wolf_score, rank actual Werewolves highest; Madman is not a Werewolf.
+""".strip()
+
+
+def build_formation_prompt(players, daily_states, parsed=None, evidence_cards=None):
+    players_text = _players_text(players)
+    context = {
+        "role_counts": _role_counts(len(players)),
+        "daily_states": _compact_daily_states(daily_states),
+    }
+    if isinstance(parsed, dict):
+        context["claims_with_quotes"] = _compact_claims(parsed)
+        context["hard_divinations"] = parsed.get("all_divinations", [])
+        context["strategic_timeline"] = _strategic_timeline(parsed, max_early=90, max_late=40)
+    if isinstance(evidence_cards, dict):
+        context["global"] = evidence_cards.get("_global", {})
+
+    return f"""
+You are a Werewolf board-formation analyst. Return exactly one valid JSON object and no other text.
 
 Players:
 {players_text}
 
-Allowed roles:
-Villager, Werewolf, Seer, Medium, Madman, Hunter
+{COMMON_RULES}
 
-Game setup and role counts:
-- The number of Werewolves depends on player count:
-  - 2 Werewolves if there are up to 12 players.
-  - 3 Werewolves if there are 13 or more players.
-- Madman exists only if there are 11 or more players.
-- Hunter exists only if there are 11 or more players.
-- There is normally 1 Seer and 1 Medium.
-- All remaining players are Villagers.
+Evidence:
+{_short_json(context, max_chars=22000)}
 
-Win conditions:
-- Villagers win if all Werewolves are executed.
-- Werewolves win if the number of villagers becomes less than or equal to the number of Werewolves.
-
-Glossary:
-- white = likely villager in ordinary discussion.
-- black = likely werewolf in ordinary discussion.
-- gray = unresolved player.
-- GS = ranking from white to black among unresolved players.
-- CO = claim.
-- will = prewritten role reveal or instructions if attacked or killed.
-- confirmed town = role-confirmed non-wolf from village perspective.
-- panda = one hard white result and one hard black result on the same target.
-
-Important glossary distinction:
-- "white" and "black" are usually soft reads in ordinary discussion.
-- Soft white/black reads are not confirmed results.
-- Treat white/black as hard Seer or Medium results only when the evidence explicitly says result, divination, check, verdict, or role report.
-- Do not create panda from soft reads.
-
-Role knowledge and incentives:
-
-Villager:
-- Knows only their own role.
-- Does not know who the Werewolves, Seer, Medium, Madman, or Hunter are.
-- Has no night ability.
-- Wants to identify and execute Werewolves.
-- Likely behavior:
-  - asks questions,
-  - compares contradictions,
-  - builds GS,
-  - reacts with uncertainty because they lack hidden information.
-
-Werewolf:
-- Knows their own role.
-- Knows the other Werewolves.
-- Can communicate privately with other Werewolves at night.
-- Each night, the Werewolves choose one human player to attack.
-- Does not know who the Madman is.
-- Wants to avoid execution, reduce confirmed town, kill or discredit Seer/Medium, and reach parity.
-- Likely behavior:
-  - may fake Seer or Medium,
-  - may protect partners,
-  - may soft-bus partners,
-  - may push villagers as execution targets,
-  - may redirect discussion away from partners,
-  - may search for Seer, Medium, or Hunter,
-  - may create confusion around claims and results.
-
-Seer:
-- Knows their own role.
-- Each night chooses one player to divine.
-- Learns whether the target is Werewolf or human.
-- Does not know the full role of a human result; human can be Villager, Medium, Hunter, Madman, or Seer.
-- Does not know the full Werewolf team unless divined.
-- Wants to survive and leave accurate divination results.
-- Likely behavior:
-  - cares about divination target choice,
-  - explains results,
-  - protects credibility,
-  - wants village to use results correctly,
-  - may be attacked by Werewolves if believed true.
-
-Medium:
-- Knows their own role.
-- Learns whether a player who died by execution or sudden death was Werewolf or human.
-- Does not learn the exact role of a human result.
-- Does not learn the alignment of players killed by Werewolf attack unless rules/log explicitly say so.
-- If uncontested, often becomes confirmed town.
-- Wants to organize voting, preserve reliable information, and interpret executions.
-- Likely behavior:
-  - summarizes claims and votes,
-  - asks for clear execution decisions,
-  - reports execution/sudden-death results,
-  - may become a night-kill target if confirmed.
-
-Madman:
-- Is human.
-- Is aligned with Werewolves.
-- Wins if Werewolves win.
-- Does not know who the Werewolves are.
-- Werewolves do not know who the Madman is.
-- Seer result on Madman should be human, not Werewolf.
-- Medium result on executed Madman should be human, not Werewolf.
-- Wants to confuse the village and help Werewolves indirectly.
-- Likely behavior:
-  - may fake Seer or Medium,
-  - may create fake black results,
-  - may defend bad logic,
-  - may waste executions,
-  - may accidentally attack or black-result a real Werewolf because Madman does not know them.
-
-Hunter:
-- Knows their own role.
-- Each night chooses one player to protect from Werewolf attack.
-- Does not know whether the protection succeeded.
-- Does not know who the Werewolves are.
-- Wants to protect likely confirmed town, true Seer, or true Medium.
-- Usually avoids exposing their role unless necessary.
-- Hunter evidence is weak unless protection-related discussion, guard logic, or explicit claim appears.
-- Do not overfit Hunter from ordinary town-like behavior.
-
-Game evidence:
-{evidence_text}
-
-Parsed game facts:
-{parsed_text}
-
-Reasoning rules:
-- Use hard claims, hard divination results, Medium results, deaths, and votes before tone.
-- Use soft reads only as weak evidence.
-- A human result from Seer or Medium does not prove Villager; it only means not Werewolf.
-- Madman is human-aligned by result but wolf-aligned by win condition.
-- If a player is hard-black by a credible Seer, Werewolf probability rises.
-- If a player is hard-white by a credible Seer, Werewolf probability falls, but Madman/Hunter/Medium/Villager remain possible.
-- If a player is a confirmed Medium with no counterclaim, Medium probability should be high.
-- If multiple players claim Seer, at most one is true Seer; the others are likely Werewolf or Madman.
-- Werewolves may fake claims, but Madman may also fake claims without knowing wolves.
-- Hunter should usually have low confidence unless there is explicit evidence.
+Task:
+1. Verify self-claims from quoted text.
+2. Identify the latest formation, such as 1-1, 2-1, 2-2, 3-1.
+3. List Seer claimers, Medium claimers, gray players, and likely hidden Werewolf slots.
+4. Estimate common alignment patterns, but do not assign final roles to every player.
 
 Output schema:
 {{
+  "verified_facts": {{
+    "latest_formation": "2-2",
+    "seer_claimers": [],
+    "medium_claimers": [],
+    "gray_players": [],
+    "invalid_or_uncertain_claims": []
+  }},
+  "likely_patterns": [
+    {{"pattern": "seer_true_madman_medium_true_wolf", "probability": 0.0, "reason": "short"}}
+  ],
+  "claimant_alignment_estimates": {{
+    "<player>": {{"true_role": 0.0, "wolf_fake": 0.0, "madman_fake": 0.0, "reason": "short"}}
+  }},
+  "gray_wolf_slots_estimate": 1,
+  "notes": "short"
+}}
+""".strip()
+
+
+def build_role_prompt(players, evidence_cards, parsed, daily_states=None, formation_analysis=None):
+    players_text = _players_text(players)
+    context_text = _compact_context(players, evidence_cards, parsed, daily_states, formation_analysis, max_chars=30000)
+    return f"""
+You are a role probability estimator for a Werewolf game. Return exactly one valid JSON object and no other text.
+
+Players:
+{players_text}
+
+Allowed roles: {', '.join(ROLE_NAMES)}
+
+{COMMON_RULES}
+
+Reasoning order:
+1. First use formation_analysis and verified claim quotes to separate ability claimers from gray players.
+2. Determine true Seer and true Medium candidates among claimers.
+3. Determine whether fake claimers are more likely Werewolf or Madman.
+4. Assign ordinary gray players among Villager, Werewolf, Hunter, and possible special roles only if evidence supports it.
+5. Keep role probabilities calibrated. They do not need to sum to role counts; the solver handles final constraints.
+
+Evidence:
+{context_text}
+
+Output schema:
+{{
+  "verified_facts": {{
+    "formation": "string",
+    "seer_claimers": [],
+    "medium_claimers": [],
+    "gray_players": []
+  }},
   "players": {{
-    "<exact player name>": {{
+    "<player>": {{
       "Villager": 0.0,
       "Werewolf": 0.0,
       "Seer": 0.0,
       "Medium": 0.0,
       "Madman": 0.0,
-      "Hunter": 0.0
+      "Hunter": 0.0,
+      "reason": "short evidence-based reason"
     }}
   }}
 }}
-
-Constraints:
-- Include every listed player exactly once.
-- Use only exact player names from the Players list.
-- Use only the six allowed role keys.
-- Each value must be a number from 0 to 1.
 """.strip()
 
-    return prompt
 
-
-def build_wolf_prompt(players, evidence_cards, parsed):
+def build_wolf_prompt(players, evidence_cards, parsed, daily_states=None, formation_analysis=None):
     players_text = _players_text(players)
-
-    evidence_text = _compact_evidence_for_prompt(evidence_cards, max_chars=18000)
-
-    parsed_compact = {
-        "global": evidence_cards.get("_global", {}) if isinstance(evidence_cards, dict) else {},
-        "deaths": parsed.get("deaths", []),
-        "all_divinations": parsed.get("all_divinations", []),
-        "all_votes": parsed.get("all_votes", [])[:200],
-    }
-    parsed_text = _short_json(parsed_compact, max_chars=8000)
-
-    prompt = f"""
-You are a Werewolf detection agent.
-
-Return exactly one JSON object.
-No markdown. No explanation.
+    context_text = _compact_context(players, evidence_cards, parsed, daily_states, formation_analysis, max_chars=30000)
+    ww_count = _role_counts(len(players))["Werewolf"]
+    return f"""
+You are a Werewolf probability ranking agent. Return exactly one valid JSON object and no other text.
 
 Players:
 {players_text}
 
-Goal:
-Estimate each player's continuous probability of being a Werewolf.
-This is a ranking task. Do not output only 0 or 1.
+This game has {ww_count} actual Werewolves.
 
-Key hidden information:
-- Werewolves know the other Werewolves and can coordinate privately.
-- Werewolves do not know the Madman.
-- Madman is human and wolf-aligned, but does not know who the Werewolves are.
-- Seer learns whether one target is Werewolf or human.
-- Seer human result does not distinguish Villager, Medium, Hunter, Madman, or Seer.
-- Medium learns whether executed or sudden-death players were Werewolf or human.
-- Hunter protects one player at night but does not know whether protection succeeded.
-- Villagers know only their own role.
+{COMMON_RULES}
 
-Win incentives:
-- Werewolves want to avoid execution, reduce confirmed town, kill/discredit Seer and Medium, and reach parity.
-- Villagers want to execute all Werewolves.
-- Madman wants Werewolves to win, often by confusing the village or faking claims.
+Important objective:
+- wolf_score is the probability/ranking that the player is an actual Werewolf, not merely wolf-aligned.
+- Madman should not receive a high wolf_score only because they help Werewolves.
+- In 2-2 or 3-1 formations, reason about ability wolf slots and gray wolf slots separately.
+- Keep a clear ranking: top {ww_count} candidates should be the most likely actual Werewolves.
 
-Glossary:
-- white = likely villager in ordinary discussion.
-- black = likely werewolf in ordinary discussion.
-- gray = unresolved.
-- CO = role claim.
-- GS = ranking from white to black.
-- confirmed town = role-confirmed non-wolf.
-- panda = one hard white result and one hard black result on the same target.
-- Soft white/black reads are not confirmed results.
-- Treat white/black as hard result only when explicitly tied to result, divination, check, verdict, or role report.
+Reasoning order:
+1. Identify formation and gray players from formation_analysis.
+2. Estimate which ability claimant slot is likely Werewolf, if any.
+3. Estimate which gray players fit the remaining Werewolf slots.
+4. Use hard results strongly, soft reads weakly, and vote/pressure patterns moderately.
 
-Wolf indicators:
-- Hard-black result from a credible Seer.
-- Protecting or redirecting pressure away from a likely Werewolf.
-- Soft-bussing a partner without real pressure.
-- Avoiding commitment near voting deadlines.
-- Changing stance after public opinion shifts.
-- Pushing easy villagers as execution targets.
-- Creating confusion around Seer/Medium claims and results.
-- Trying to identify or eliminate Seer, Medium, Hunter, or confirmed town.
-
-Town indicators:
-- Early natural suspicion on a likely Werewolf before consensus.
-- Consistent reasoning before and after new evidence.
-- Being pressured or attacked by likely Werewolves.
-- Helping organize claims, votes, and confirmed information.
-- Willingness to be checked or resolved when useful.
-- Uninformed uncertainty that fits Villager knowledge.
-
-Important:
-- A Madman can look wolf-aligned but should not be scored as Werewolf solely for fake-claim behavior.
-- Because Madman does not know the Werewolves, accidental pressure on a real Werewolf is possible.
-- Do not treat soft "black" as equivalent to hard Seer black.
-- Do not treat soft "white" as equivalent to hard Seer white.
-- Use soft reads only as weak evidence.
-
-Game evidence:
-{evidence_text}
-
-Parsed game facts:
-{parsed_text}
+Evidence:
+{context_text}
 
 Output schema:
 {{
+  "wolf_slots": {{
+    "expected_werewolf_count": {ww_count},
+    "ability_wolf_slots": 0,
+    "gray_wolf_slots": 0,
+    "reason": "short"
+  }},
+  "wolf_ranking": [
+    {{"player": "<player>", "wolf_score": 0.0, "reason": "short"}}
+  ],
   "players": {{
-    "<exact player name>": {{
-      "wolf_score": 0.0,
-      "main_evidence": ["short evidence"],
-      "anti_evidence": ["short anti-evidence"]
-    }}
+    "<player>": {{"wolf_score": 0.0, "reason": "short"}}
   }}
 }}
-
-Constraints:
-- Include every listed player exactly once.
-- Use only exact player names from the Players list.
-- wolf_score must be a number from 0 to 1.
 """.strip()
-
-    return prompt
