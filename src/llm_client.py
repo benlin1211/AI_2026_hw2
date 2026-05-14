@@ -2,7 +2,10 @@ import json
 import re
 from typing import Any, Dict, Tuple
 
-from llama_cpp import Llama
+try:
+    from llama_cpp import Llama
+except Exception:
+    Llama = None
 
 
 class LocalLLM:
@@ -16,6 +19,8 @@ class LocalLLM:
     ):
         self.temperature = temperature
         self.max_tokens = max_tokens
+        if Llama is None:
+            raise ImportError("llama-cpp-python is not installed. Install it or run with --no_llm.")
         self.llm = Llama(
             model_path=model_path,
             n_ctx=n_ctx,

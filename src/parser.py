@@ -909,3 +909,33 @@ def build_daily_states(parsed: Dict[str, Any], players: List[str]) -> Dict[str, 
         }
 
     return states
+
+def chunk_messages_by_day(parsed: Dict[str, Any], chunk_size: int = 100, overlap: int = 12) -> Dict[str, List[List[Dict[str, Any]]]]:
+    """
+    Build message chunks for LLM extraction.
+    The chunking follows the proposal: process day-by-day and avoid sending full logs at once.
+    """
+    out: Dict[str, List[List[Dict[str, Any]]]] = {}
+    step = max(1, chunk_size - max(0, overlap))
+
+    for day in _sort_days(parsed.get("days", {})):
+        messages = parsed["days"][day].get("messages", [])
+        normalized = []
+        for m in messages:
+            item = dict(m)
+            item["day"] = day
+            normalized.append(item)
+
+        if not normalized:
+            out[day] = []
+            continue
+
+        chunks = []
+        for start in range(0, len(normalized), step):
+            chunk = normalized[start:start + chunk_size]
+            if chunk:
+                chunks.append(chunk)
+            if start + chunk_size >= len(normalized):
+                break
+        out[day] = chunks
+    return out
