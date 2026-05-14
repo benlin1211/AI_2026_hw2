@@ -1,146 +1,185 @@
+"""Fast deterministic multi-agent Werewolf predictor.
+
+Mandatory pipeline per game:
+1. ParserAgent              -> parser.py
+2. ObjectiveEventAgent      -> events.py
+3. BoardStateAgent          -> board_state.py
+4. FormationPolicyAgent     -> formation_policy.py
+5. InteractionAgent         -> interaction.py + stepwise_scorer.py
+6. GuidelineScorerAgent     -> guideline_scorer_fast.py
+7. WolfScoreAggregator      -> aggregator.py
+8. BeamRoleSolver           -> beam_solver.py
+
+No LLM calls are made in this entrypoint. This is intended as the fast default.
+"""
+from __future__ import annotations
+
 import argparse
-import json
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 from tqdm import tqdm
 
-from src.parser import parse_game_log, build_evidence_cards, build_daily_states, chunk_messages_by_day
-from src.llm_client import LocalLLM
-from src.agents import RoleReasoningAgent, WolfReasoningAgent, FormationAgent, EventExtractionAgent, StateTrackerAgent, fallback_role_prior, fallback_wolf_scores
-from src.solver import constrained_role_assignment, normalize_wolf_scores
+from src.parser import (
+    parse_game_log,
+    build_evidence_cards,
+    build_daily_states,
+    build_objective_pack,
+    build_strategic_snippets,
+)
+from src.events import extract_objective_events, extract_repaired_claims, apply_claim_repairs_to_parsed
+from src.board_state import build_fast_board_states
+from src.formation_policy import analyze_formation_policy
+from src.interaction import build_interaction_graph
+from src.stepwise_scorer import score_interactions, compute_wolf_feature_prior
+from src.agents import fallback_role_prior, fallback_wolf_scores
+from src.solver import constrained_role_assignment
+from src.beam_solver import solve_topk_worlds, best_assignment_from_worlds
+from src.guideline_scorer_fast import score_guidelines
+from src.aggregator import aggregate_wolf_scores, assign_roles_from_marginals
+from src.audit import audit_and_fix
+from src.hard_constraints import (
+    derive_hard_constraints,
+    attach_constraints_to_pack,
+    apply_hard_constraints_to_role_scores,
+    apply_hard_constraints_to_wolf_scores,
+    hard_constraint_report,
+)
 from src.debug_logger import DebugLogger
 
+
 def load_game_log(corpus_dir: Path, game_index: str) -> str:
-    """
-    Expected filename example:
-    Werewolf_Prediction_Dataset/01.txt
-    """
     path = corpus_dir / f"{game_index}.txt"
     if not path.exists():
         raise FileNotFoundError(f"Missing game log: {path}")
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
-def infer_one_game(
+def infer_one_game_fast(
     game_index: str,
     game_rows: pd.DataFrame,
     corpus_dir: Path,
-    role_agent: RoleReasoningAgent,
-    wolf_agent: WolfReasoningAgent,
-    formation_agent: FormationAgent,
-    event_agent: EventExtractionAgent = None,
-    state_agent: StateTrackerAgent = None,
-    debug_logger=None,
-    use_llm: bool = True,
+    debug_logger: Optional[DebugLogger] = None,
+    beam_top_k: int = 256,
+    max_role_candidates: int = 6,
+    max_wolf_candidates: int = 9,
+    max_hunter_candidates: int = 6,
 ) -> pd.DataFrame:
     players = game_rows["character"].tolist()
     raw_text = load_game_log(corpus_dir, game_index)
 
+    # 1. ParserAgent.
     parsed = parse_game_log(raw_text, players)
+
+    # Claim repair is still deterministic. It fixes common translated-log issues:
+    # bare "Seer claim:" self-claims and false positives from discussing another
+    # player's claim.
+    repaired_claims = extract_repaired_claims(raw_text, players)
+    parsed = apply_claim_repairs_to_parsed(parsed, repaired_claims)
+
     evidence_cards = build_evidence_cards(parsed, players)
-    daily_states = build_daily_states(parsed, players)
+    daily_states_baseline = build_daily_states(parsed, players)
+    objective_pack = build_objective_pack(parsed, players)
+    strategic_snippets = build_strategic_snippets(parsed, players)
 
-    # Agent 1 + Agent 2: optional LLM extraction/state tracking over day chunks.
-    # Regex parsing remains as deterministic backing evidence.
-    llm_event_outputs = []
-    llm_state = {
-        "alive_players": players,
-        "dead_players": [],
-        "seer_claimers": [],
-        "medium_claimers": [],
-        "formation": "0-0",
-        "gray_players": players,
-        "notes": ["initial empty state"],
-    }
+    # 2. ObjectiveEventAgent.
+    objective_events = extract_objective_events(raw_text, parsed, players)
+    objective_events["repaired_claims"] = repaired_claims
 
-    if use_llm and event_agent is not None and state_agent is not None:
-        chunks_by_day = chunk_messages_by_day(parsed, chunk_size=100, overlap=12)
-        for day, chunks in chunks_by_day.items():
-            for chunk_i, messages in enumerate(chunks):
-                day_key = f"{day}_{chunk_i:02d}" if len(chunks) > 1 else str(day)
-                extracted = event_agent.extract(
-                    game_index=game_index,
-                    day=day_key,
-                    players=players,
-                    messages=messages,
-                    previous_state=llm_state,
-                )
-                llm_event_outputs.append(extracted)
-                llm_state = state_agent.update(
-                    game_index=game_index,
-                    day=day_key,
-                    players=players,
-                    previous_state=llm_state,
-                    extracted_events=extracted,
-                )
+    # Merge event-derived fields into objective_pack for downstream scorer.
+    objective_pack = dict(objective_pack)
+    objective_pack["hunter_claimers"] = list(dict.fromkeys([x.get("player") for x in objective_events.get("hunter_claims", []) if x.get("player")]))
+    if objective_events.get("seer_results"):
+        objective_pack["hard_results"] = objective_events["seer_results"]
 
-        parsed["llm_events"] = llm_event_outputs
-        parsed["llm_state"] = llm_state
-        # Make the LLM board state visible to downstream prompts without replacing deterministic states.
-        daily_states["llm_final"] = llm_state
+    # Public-rule hard constraints must be attached before board state, scoring, and beam search.
+    hard_constraints = derive_hard_constraints(players, objective_events, objective_pack)
+    objective_events["hard_constraints"] = hard_constraints
+    objective_pack = attach_constraints_to_pack(objective_pack, hard_constraints)
+
+    # 3. BoardStateAgent.
+    board_states = build_fast_board_states(parsed, objective_events, players)
+
+    # 4. FormationPolicyAgent.
+    formation_policy = analyze_formation_policy(board_states)
+
+    # 5. InteractionAgent.
+    interaction_graph = build_interaction_graph(strategic_snippets, players, objective_pack=objective_pack)
+    stepwise_scores = score_interactions(players, interaction_graph, objective_pack)
+    wolf_prior = compute_wolf_feature_prior(players, stepwise_scores, objective_pack)
+
+    # 6. GuidelineScorerAgent.
+    guideline_scores = score_guidelines(
+        players=players,
+        board_states=board_states,
+        objective_events=objective_events,
+        interaction_graph=interaction_graph,
+        objective_pack=objective_pack,
+    )
+
+    # Fast deterministic role/wolf priors.
+    role_scores = fallback_role_prior(players, parsed)
+    base_wolf_scores = fallback_wolf_scores(players, parsed)
+
+    # Apply hard public constraints before the beam solver.
+    role_scores = apply_hard_constraints_to_role_scores(players, role_scores, hard_constraints)
+    base_wolf_scores = apply_hard_constraints_to_wolf_scores(players, base_wolf_scores, hard_constraints)
+    wolf_prior = apply_hard_constraints_to_wolf_scores(players, wolf_prior, hard_constraints)
+
+    # 8. BeamRoleSolver / world marginals.
+    world_result = solve_topk_worlds(
+        players=players,
+        role_scores=role_scores,
+        wolf_scores=base_wolf_scores,
+        wolf_prior=wolf_prior,
+        objective_pack=objective_pack,
+        objective_events=objective_events,
+        guideline_scores=guideline_scores,
+        top_k=beam_top_k,
+        max_role_candidates=max_role_candidates,
+        max_wolf_candidates=max_wolf_candidates,
+        max_hunter_candidates=max_hunter_candidates,
+    )
+
+    fallback_assignment = constrained_role_assignment(players=players, role_scores=role_scores, parsed=parsed)
+    world_assignment = best_assignment_from_worlds(world_result, players)
+    assigned_roles = assign_roles_from_marginals(players, world_result, fallback_assignment=world_assignment or fallback_assignment)
+
+    # 7. WolfScoreAggregator.
+    final_wolf_scores = aggregate_wolf_scores(
+        players=players,
+        role_scores=role_scores,
+        base_wolf_scores=base_wolf_scores,
+        wolf_prior=wolf_prior,
+        guideline_scores=guideline_scores,
+        world_result=world_result,
+        objective_pack=objective_pack,
+        objective_events=objective_events,
+        assigned_roles=assigned_roles,
+    )
+
+    assigned_roles, final_wolf_scores = audit_and_fix(players, assigned_roles, final_wolf_scores, role_scores, hard_constraints=hard_constraints)
+    constraint_report = hard_constraint_report(players, assigned_roles, hard_constraints)
 
     if debug_logger:
         debug_logger.save_parsed_game(game_index, parsed)
         debug_logger.save_evidence_cards(game_index, evidence_cards)
-        debug_logger.save_json(game_index, "daily_states", daily_states)
-        debug_logger.save_json(game_index, "llm_events", {"items": llm_event_outputs})
-        debug_logger.save_json(game_index, "llm_state", llm_state)
-
-    formation_analysis = {}
-    if use_llm and formation_agent is not None:
-        formation_analysis = formation_agent.predict(
-            players=players,
-            daily_states=daily_states,
-            game_index=game_index,
-        )
-
-    # Default probabilities from evidence.
-    if use_llm:
-        role_scores = role_agent.predict(
-            players,
-            evidence_cards,
-            parsed,
-            daily_states=daily_states,
-            formation_analysis=formation_analysis,
-            game_index=game_index,
-        )
-
-        wolf_scores = wolf_agent.predict(
-            players,
-            evidence_cards,
-            parsed,
-            daily_states=daily_states,
-            formation_analysis=formation_analysis,
-            game_index=game_index,
-        )
-    else:
-        role_scores = fallback_role_prior(players, parsed)
-        wolf_scores = fallback_wolf_scores(players, parsed)
-
-    assigned_roles = constrained_role_assignment(
-        players=players,
-        role_scores=role_scores,
-        parsed=parsed,
-    )
-
-    final_wolf_scores = normalize_wolf_scores(
-        players=players,
-        wolf_scores=wolf_scores,
-        role_scores=role_scores,
-        assigned_roles=assigned_roles,
-        parsed=parsed,
-    )
-
-    # Gerd is the fixed system victim/optimist in these logs, not an ordinary hidden-role candidate.
-    for p in players:
-        if p == "Optimist Gerd" or p.strip().lower() == "gerd":
-            assigned_roles[p] = "Villager"
-            final_wolf_scores[p] = 0.01
-
-    if debug_logger:
-        debug_logger.save_json(game_index, "solver_assigned_roles", assigned_roles)
-        debug_logger.save_json(game_index, "final_wolf_scores", final_wolf_scores)
+        debug_logger.save_json(game_index, "daily_states_baseline", daily_states_baseline)
+        debug_logger.save_json(game_index, "objective_pack_fast", objective_pack)
+        debug_logger.save_json(game_index, "objective_events_fast", objective_events)
+        debug_logger.save_json(game_index, "hard_constraints_fast", hard_constraints)
+        debug_logger.save_json(game_index, "hard_constraint_report_fast", constraint_report)
+        debug_logger.save_json(game_index, "board_states_fast", board_states)
+        debug_logger.save_json(game_index, "formation_policy_fast", formation_policy)
+        debug_logger.save_json(game_index, "strategic_snippets_fast", {"items": strategic_snippets})
+        debug_logger.save_json(game_index, "interaction_graph_fast", interaction_graph)
+        debug_logger.save_json(game_index, "stepwise_scores_fast", stepwise_scores)
+        debug_logger.save_json(game_index, "wolf_prior_fast", wolf_prior)
+        debug_logger.save_json(game_index, "guideline_scores_fast", guideline_scores)
+        debug_logger.save_json(game_index, "world_result_fast", world_result)
+        debug_logger.save_json(game_index, "assigned_roles_fast", assigned_roles)
+        debug_logger.save_json(game_index, "final_wolf_scores_fast", final_wolf_scores)
 
     out = game_rows.copy()
     out["role"] = out["character"].map(assigned_roles)
@@ -148,70 +187,45 @@ def infer_one_game(
     return out
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--roles_csv", type=str, default="Werewolf_Prediction_Dataset/public/roles.csv")
-    parser.add_argument("--corpus_dir", type=str, default="Werewolf_Prediction_Dataset")
-    parser.add_argument("--model_path", type=str, default=None)
-    parser.add_argument("--output", type=str, default="submission_public.csv")
-    parser.add_argument("--no_llm", action="store_true")
-    parser.add_argument("--n_ctx", type=int, default=4096)
-    parser.add_argument("--n_gpu_layers", type=int, default=-1)
-    parser.add_argument("--max_tokens", type=int, default=512)
-    parser.add_argument("--debug_dir", type=str, default="debug_runs")
+    parser.add_argument("--corpus_dir", type=str, default="Werewolf_Prediction_Dataset/public")
+    parser.add_argument("--output", type=str, default="submission_fast.csv")
+    parser.add_argument("--debug_dir", type=str, default="debug_runs_fast")
     parser.add_argument("--disable_debug", action="store_true")
+    parser.add_argument("--beam_top_k", type=int, default=256)
+    parser.add_argument("--max_role_candidates", type=int, default=6)
+    parser.add_argument("--max_wolf_candidates", type=int, default=9)
+    parser.add_argument("--max_hunter_candidates", type=int, default=6)
     args = parser.parse_args()
 
-    print(args.roles_csv)
     roles_df = pd.read_csv(args.roles_csv)
     corpus_dir = Path(args.corpus_dir)
-
-    if not args.no_llm and not args.model_path:
-        raise ValueError("--model_path is required unless --no_llm is set")
-
-    llm = None
-    if not args.no_llm:
-        llm = LocalLLM(
-            model_path=args.model_path,
-            n_ctx=args.n_ctx,
-            n_gpu_layers=args.n_gpu_layers,
-            max_tokens=args.max_tokens,
-        )
-
-    debug_logger = DebugLogger(
-        debug_dir=args.debug_dir,
-        enabled=not args.disable_debug,
-    )
-
-    role_agent = RoleReasoningAgent(llm, debug_logger=debug_logger) if llm else None
-    wolf_agent = WolfReasoningAgent(llm, debug_logger=debug_logger) if llm else None
-    formation_agent = FormationAgent(llm, debug_logger=debug_logger) if llm else None
-    event_agent = EventExtractionAgent(llm, debug_logger=debug_logger) if llm else None
-    state_agent = StateTrackerAgent(llm, debug_logger=debug_logger) if llm else None
+    debug_logger = DebugLogger(debug_dir=args.debug_dir, enabled=not args.disable_debug)
 
     outputs = []
     for game_index, game_rows in tqdm(roles_df.groupby("index")):
         game_index = str(game_index).zfill(2)
-
         try:
-            result = infer_one_game(
+            result = infer_one_game_fast(
                 game_index=game_index,
                 game_rows=game_rows,
                 corpus_dir=corpus_dir,
-                role_agent=role_agent,
-                wolf_agent=wolf_agent,
-                formation_agent=formation_agent,
-                event_agent=event_agent,
-                state_agent=state_agent,
                 debug_logger=debug_logger,
-                use_llm=not args.no_llm,
+                beam_top_k=args.beam_top_k,
+                max_role_candidates=args.max_role_candidates,
+                max_wolf_candidates=args.max_wolf_candidates,
+                max_hunter_candidates=args.max_hunter_candidates,
             )
             outputs.append(result)
         except Exception as e:
             print(f"[WARN] Game {game_index} failed: {e}")
+            if debug_logger:
+                debug_logger.save_error(game_index, "infer_one_game_fast", e)
             fallback = game_rows.copy()
             fallback["role"] = "Villager"
-            fallback["wolf_score"] = 0.2
+            fallback["wolf_score"] = 0.20
             mask_gerd = fallback["character"].astype(str).str.strip().str.lower().isin(["optimist gerd", "gerd"])
             fallback.loc[mask_gerd, "wolf_score"] = 0.01
             outputs.append(fallback)
@@ -224,4 +238,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

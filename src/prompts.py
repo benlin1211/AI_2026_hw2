@@ -143,8 +143,6 @@ def build_role_prompt(players, evidence_cards, parsed, daily_states=None, format
         "deaths": parsed.get("deaths", []),
         "all_divinations": parsed.get("all_divinations", []),
         "all_votes": parsed.get("all_votes", [])[:200],
-        "llm_events": parsed.get("llm_events", [])[-12:],
-        "llm_state": parsed.get("llm_state", {}),
     }
 
     parsed_text = _short_json(parsed_compact, max_chars=8000)
@@ -346,8 +344,6 @@ def build_wolf_prompt(players, evidence_cards, parsed, daily_states=None, format
         "deaths": parsed.get("deaths", []),
         "all_divinations": parsed.get("all_divinations", []),
         "all_votes": parsed.get("all_votes", [])[:200],
-        "llm_events": parsed.get("llm_events", [])[-12:],
-        "llm_state": parsed.get("llm_state", {}),
     }
     parsed_text = _short_json(parsed_compact, max_chars=8000)
     formation_text = _short_json(formation_analysis or {}, max_chars=6000)
@@ -513,157 +509,4 @@ Output schema:
   }},
   "gray_wolf_slots_estimate": 1
 }}
-""".strip()
-
-def _compact_messages_for_extraction(messages, max_messages=120, max_text=700):
-    out = []
-    for m in messages[:max_messages]:
-        out.append({
-            "day": m.get("day"),
-            "order": m.get("no"),
-            "time": m.get("time"),
-            "speaker": m.get("speaker"),
-            "text": str(m.get("text", ""))[:max_text],
-        })
-    return _short_json(out, max_chars=50000)
-
-
-def build_event_extraction_prompt(game_index, day, players, messages, previous_state=None):
-    players_text = _players_text(players)
-    messages_text = _compact_messages_for_extraction(messages)
-    prev_text = _short_json(previous_state or {}, max_chars=12000)
-
-    return f"""
-You are Agent 1, a Werewolf log event extractor.
-
-Return exactly one JSON object. No markdown. No explanation.
-
-Game: {game_index}
-Day: {day}
-
-Players:
-{players_text}
-
-Previous cumulative state, if any:
-{prev_text}
-
-Raw messages for this chunk:
-{messages_text}
-
-Task:
-Extract only strategically useful events. Do not infer final roles. Do not chat.
-
-Ignore noise:
-- roleplay, food, greetings, jokes, weather, thanks, emoji-only messages
-- ordinary flavor text with no role, vote, death, attack, suspicion, or result information
-
-Keep these event types:
-- claim: Seer CO, Medium CO, Hunter CO, or other explicit first-person role claim
-- non_claim: not Seer, not Medium, not Seer/Medium
-- divination: hard Seer result only; must explicitly be a result/check/divination/verdict
-- medium_result: hard Medium result only; must explicitly be a Medium/霊 result
-- vote: vote, execution preference, seer target preference, symbols such as ● ○ ▼ ▽
-- execution: player executed by vote
-- attack: player killed by Werewolf/night attack
-- sudden_death: player died because of no post/no action
-- suspicion: speaker suspects target as Werewolf or black-ish
-- townread: speaker reads target as villager/white-ish
-- formation: 1-1, 2-1, 3-1, 3-2, etc.
-- contradiction: explicit retraction, contradiction, or perspective slip
-- other_relevant: only if it affects role inference
-
-Strict distinctions:
-- white/black in ordinary discussion are soft reads, not hard results.
-- A human result means non-Werewolf, not Villager.
-- Madman is not a Werewolf; do not add it to wolf_score.
-- Only record a role claim when the speaker self-claims. If the speaker says another player claimed, target should be that other player and event should explain it.
-
-Output schema:
-{{
-  "game_id": "{game_index}",
-  "day": "{day}",
-  "events": [
-    {{
-      "type": "claim | non_claim | divination | medium_result | vote | execution | attack | sudden_death | suspicion | townread | formation | contradiction | other_relevant",
-      "speaker": "exact player name or system",
-      "target": "exact player name or null",
-      "content": "short normalized event",
-      "evidence": "message number and short quote",
-      "confidence": 0.0
-    }}
-  ],
-  "noise_summary": "short description of ignored noise"
-}}
-
-Constraints:
-- Use exact player names from the list whenever possible.
-- Include at most 60 events.
-- confidence must be numeric from 0 to 1.
-""".strip()
-
-
-def build_state_tracker_prompt(players, previous_state, extracted_events, day):
-    players_text = _players_text(players)
-    prev_text = _short_json(previous_state or {}, max_chars=18000)
-    events_text = _short_json(extracted_events or {}, max_chars=26000)
-
-    return f"""
-You are Agent 2, a Werewolf board-state tracker.
-
-Return exactly one JSON object. No markdown. No explanation.
-
-Players:
-{players_text}
-
-Previous cumulative state:
-{prev_text}
-
-New extracted events for day/chunk {day}:
-{events_text}
-
-Task:
-Update the cumulative public board state. Do not assign final hidden roles.
-
-Track:
-- alive and dead players
-- Seer claimers, Medium claimers, Hunter claimers
-- not Seer / not Medium claims
-- hard Seer results and hard Medium results
-- execution, attack, sudden death history
-- vote pressure and target preferences
-- major suspicions and townreads
-- current formation, such as 1-1, 2-1, 3-1, 3-2
-- gray players, excluding current Seer/Medium claimers and dead players
-- unresolved contradictions or retractions
-
-Output schema:
-{{
-  "day": "{day}",
-  "alive_players": [],
-  "dead_players": [],
-  "seer_claimers": [],
-  "medium_claimers": [],
-  "hunter_claimers": [],
-  "not_seer_medium_claimers": [],
-  "formation": "0-0",
-  "hard_results": [
-    {{"source": "player", "target": "player", "result": "human|werewolf", "kind": "seer|medium", "day": "..."}}
-  ],
-  "deaths": [
-    {{"day": "...", "player": "...", "cause": "attack|execution|sudden_death|unknown"}}
-  ],
-  "votes": [
-    {{"day": "...", "voter": "...", "target": "...", "type": "execution|seer_target|other"}}
-  ],
-  "major_conflicts": [
-    {{"a": "...", "b": "...", "summary": "..."}}
-  ],
-  "gray_players": [],
-  "notes": []
-}}
-
-Constraints:
-- Use exact player names only.
-- Preserve prior state unless new events update it.
-- If evidence is ambiguous, add a note instead of treating it as hard fact.
 """.strip()

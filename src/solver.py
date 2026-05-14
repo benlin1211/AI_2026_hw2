@@ -1,5 +1,4 @@
-from typing import Dict, List, Any
-
+from typing import Dict, List, Any, Optional
 
 VALID_ROLES = ["Villager", "Werewolf", "Seer", "Medium", "Madman", "Hunter"]
 
@@ -14,12 +13,11 @@ def get_role_counts(num_players: int) -> Dict[str, int]:
     }
 
 
-def safe_score(
-    role_scores: Dict[str, Dict[str, float]],
-    player: str,
-    role: str,
-    default: float = 0.0,
-) -> float:
+def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, float(x)))
+
+
+def safe_score(role_scores: Dict[str, Dict[str, float]], player: str, role: str, default: float = 0.0) -> float:
     try:
         return float(role_scores.get(player, {}).get(role, default))
     except Exception:
@@ -28,9 +26,7 @@ def safe_score(
 
 def get_claims(parsed: Dict[str, Any], player: str) -> List[Any]:
     claims = parsed.get("all_claims", {}).get(player, [])
-    if not isinstance(claims, list):
-        return []
-    return claims
+    return claims if isinstance(claims, list) else []
 
 
 def claim_name(c: Any) -> str:
@@ -40,8 +36,7 @@ def claim_name(c: Any) -> str:
 
 
 def has_claim(parsed: Dict[str, Any], player: str, claim_keyword: str) -> bool:
-    claims = get_claims(parsed, player)
-    return any(claim_keyword in claim_name(c) for c in claims)
+    return any(claim_keyword in claim_name(c) for c in get_claims(parsed, player))
 
 
 def count_claimers(parsed: Dict[str, Any], claim_keyword: str) -> int:
@@ -52,38 +47,28 @@ def count_claimers(parsed: Dict[str, Any], claim_keyword: str) -> int:
     return n
 
 
-def candidate_score_for_role(
-    player: str,
-    role: str,
-    role_scores: Dict[str, Dict[str, float]],
-    parsed: Dict[str, Any],
-) -> float:
-    """
-    Conservative role score.
-    Do not over-lock claimers into true Seer/Medium.
-    Fake claimers are often Werewolf or Madman.
-    """
+def candidate_score_for_role(player: str, role: str, role_scores: Dict[str, Dict[str, float]], parsed: Dict[str, Any]) -> float:
     score = safe_score(role_scores, player, role, default=0.0)
 
     if has_claim(parsed, player, "Seer CO"):
         if role == "Seer":
-            score += 0.25
+            score += 0.28
         elif role == "Madman":
             score += 0.12
         elif role == "Werewolf":
             score += 0.08
-        elif role in ("Villager", "Hunter", "Medium"):
-            score -= 0.12
+        else:
+            score -= 0.10
 
     if has_claim(parsed, player, "Medium CO"):
         if role == "Medium":
-            score += 0.22
+            score += 0.28
         elif role == "Werewolf":
             score += 0.08
         elif role == "Madman":
             score += 0.06
-        elif role in ("Villager", "Hunter", "Seer"):
-            score -= 0.12
+        else:
+            score -= 0.10
 
     if has_claim(parsed, player, "Not Seer/Medium"):
         if role in ("Seer", "Medium"):
@@ -93,118 +78,58 @@ def candidate_score_for_role(
 
     if has_claim(parsed, player, "Not Seer") and role == "Seer":
         score -= 0.25
-
     if has_claim(parsed, player, "Not Medium") and role == "Medium":
         score -= 0.25
 
     return score
 
 
-def assign_best_candidate(
-    role: str,
-    count: int,
-    remaining: set,
-    assigned: Dict[str, str],
-    role_scores: Dict[str, Dict[str, float]],
-    parsed: Dict[str, Any],
-) -> None:
+def assign_best_candidate(role: str, count: int, remaining: set, assigned: Dict[str, str], role_scores: Dict[str, Dict[str, float]], parsed: Dict[str, Any]) -> None:
     if count <= 0 or not remaining:
         return
-
     candidates = []
     for p in remaining:
-        score = candidate_score_for_role(
-            player=p,
-            role=role,
-            role_scores=role_scores,
-            parsed=parsed,
-        )
+        score = candidate_score_for_role(p, role, role_scores, parsed)
         candidates.append((score, p))
-
     candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-
     for _, p in candidates[:count]:
         assigned[p] = role
         remaining.discard(p)
 
 
-def constrained_role_assignment(
-    players: List[str],
-    role_scores: Dict[str, Dict[str, float]],
-    parsed: Dict[str, Any],
-) -> Dict[str, str]:
-    """
-    Stable greedy assignment.
-
-    Priority intentionally keeps role slots simple.
-    This tends to be more robust than over-constrained global search when
-    role_scores are noisy.
-    """
+def constrained_role_assignment(players: List[str], role_scores: Dict[str, Dict[str, float]], parsed: Dict[str, Any]) -> Dict[str, str]:
     role_counts = get_role_counts(len(players))
-
     assigned: Dict[str, str] = {}
     remaining = set(players)
 
-    # 1. Seer first.
-    # In multi-claim games, putting Seer before Medium avoids Medium claimers
-    # stealing too much solver priority.
-    assign_best_candidate(
-        role="Seer",
-        count=role_counts.get("Seer", 0),
-        remaining=remaining,
-        assigned=assigned,
-        role_scores=role_scores,
-        parsed=parsed,
-    )
-
-    # 2. Medium.
-    assign_best_candidate(
-        role="Medium",
-        count=role_counts.get("Medium", 0),
-        remaining=remaining,
-        assigned=assigned,
-        role_scores=role_scores,
-        parsed=parsed,
-    )
-
-    # 3. Werewolves.
-    assign_best_candidate(
-        role="Werewolf",
-        count=role_counts.get("Werewolf", 0),
-        remaining=remaining,
-        assigned=assigned,
-        role_scores=role_scores,
-        parsed=parsed,
-    )
-
-    # 4. Madman.
-    assign_best_candidate(
-        role="Madman",
-        count=role_counts.get("Madman", 0),
-        remaining=remaining,
-        assigned=assigned,
-        role_scores=role_scores,
-        parsed=parsed,
-    )
-
-    # 5. Hunter.
-    assign_best_candidate(
-        role="Hunter",
-        count=role_counts.get("Hunter", 0),
-        remaining=remaining,
-        assigned=assigned,
-        role_scores=role_scores,
-        parsed=parsed,
-    )
+    # Ability roles first: this preserves role accuracy better than pushing Werewolf too early.
+    for role in ["Seer", "Medium", "Madman", "Hunter", "Werewolf"]:
+        assign_best_candidate(role, role_counts.get(role, 0), remaining, assigned, role_scores, parsed)
 
     for p in remaining:
         assigned[p] = "Villager"
-
     for p in players:
-        if p not in assigned:
-            assigned[p] = "Villager"
-
+        assigned.setdefault(p, "Villager")
     return assigned
+
+
+def _formation_prior(player: str, parsed: Dict[str, Any], objective_pack: Optional[Dict[str, Any]]) -> float:
+    if player == "Optimist Gerd" or player.strip().lower() == "gerd":
+        return 0.01
+    obj = objective_pack or {}
+    seer_claimers = obj.get("seer_claimers", []) or []
+    medium_claimers = obj.get("medium_claimers", []) or []
+    gray = set(obj.get("gray_players", []) or [])
+    prior = 0.20
+    if player in gray:
+        prior += 0.02
+    if player in seer_claimers:
+        prior += 0.07 if len(seer_claimers) >= 2 else -0.05
+    if player in medium_claimers:
+        prior += 0.06 if len(medium_claimers) >= 2 else -0.07
+    if has_claim(parsed, player, "Not Seer/Medium"):
+        prior -= 0.02
+    return _clamp(prior, 0.03, 0.85)
 
 
 def normalize_wolf_scores(
@@ -213,105 +138,84 @@ def normalize_wolf_scores(
     role_scores: Dict[str, Dict[str, float]],
     assigned_roles: Dict[str, str],
     parsed: Dict[str, Any],
+    stepwise_prior: Optional[Dict[str, float]] = None,
+    objective_pack: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, float]:
-    scores: Dict[str, float] = {}
+    """
+    MaKTO-inspired v2 score fusion.
 
+    The role assignment is only a weak signal. This prevents the prior failure mode
+    where a true wolf assigned as Medium/Hunter gets compressed to 0.01.
+    """
+    scores: Dict[str, float] = {}
+    stepwise_prior = stepwise_prior or {}
+    role_counts = (objective_pack or {}).get("role_counts", get_role_counts(len(players)))
+    ww_count = int(role_counts.get("Werewolf", 3 if len(players) >= 13 else 2))
     seer_claimers = count_claimers(parsed, "Seer CO")
     medium_claimers = count_claimers(parsed, "Medium CO")
 
     for p in players:
+        if p == "Optimist Gerd" or p.strip().lower() == "gerd":
+            scores[p] = 0.01
+            continue
+
         try:
-            base = float(wolf_scores.get(p, 0.20))
+            llm_wolf = float(wolf_scores.get(p, 0.20))
         except Exception:
-            base = 0.20
-
+            llm_wolf = 0.20
+        prior = float(stepwise_prior.get(p, 0.20))
         role_wolf = safe_score(role_scores, p, "Werewolf", default=0.0)
+        formation = _formation_prior(p, parsed, objective_pack)
 
-        # More trust in wolf_agent ranking.
-        score = 0.75 * base + 0.25 * role_wolf
+        # Main blend: wolf agent and stepwise heuristic dominate; role solver is weak.
+        score = 0.48 * llm_wolf + 0.27 * prior + 0.13 * formation + 0.12 * role_wolf
 
         assigned = assigned_roles.get(p)
-
-        # Smaller assignment adjustment than before.
-        # Do not let role solver dominate AP.
         if assigned == "Werewolf":
-            score += 0.06
-
-        if assigned == "Seer":
-            if seer_claimers <= 1:
-                score -= 0.16
+            score += 0.035
+        elif assigned == "Madman":
+            score -= 0.015
+        elif assigned == "Seer":
+            # Only lower strongly if claim is explicit and uncontested.
+            if has_claim(parsed, p, "Seer CO") and seer_claimers <= 1:
+                score -= 0.055
             else:
-                score -= 0.01
-
-        if assigned == "Medium":
-            if medium_claimers <= 1:
-                score -= 0.16
+                score -= 0.005
+        elif assigned == "Medium":
+            if has_claim(parsed, p, "Medium CO") and medium_claimers <= 1:
+                score -= 0.055
             else:
-                score -= 0.01
+                score -= 0.005
+        elif assigned == "Hunter":
+            score -= 0.005
 
-        if assigned == "Madman":
-            # Madman is not Werewolf.
-            score -= 0.02
-
-        # Claimers in contested formations are often either true role, wolf, or madman.
-        # Do not over-lower them.
-        if has_claim(parsed, p, "Seer CO") and seer_claimers >= 2:
-            score += 0.02
-
-        if has_claim(parsed, p, "Medium CO") and medium_claimers >= 2:
-            score += 0.02
-
-        received = [
-            r for r in parsed.get("all_divinations", [])
-            if isinstance(r, dict) and r.get("target") == p
-        ]
-
-        black_count = sum(
-            1 for r in received
-            if r.get("result") == "werewolf"
-        )
-        white_count = sum(
-            1 for r in received
-            if r.get("result") == "human"
-        )
-
-        if black_count > 0:
-            score += 0.08 * black_count
-
-        if white_count > 0:
-            score -= 0.04 * white_count
-
-        soft_received = [
-            r for r in parsed.get("all_soft_reads", [])
-            if isinstance(r, dict) and r.get("target") == p
-        ]
-
-        likely_wolf_reads = sum(
-            1 for r in soft_received
-            if r.get("read") == "likely_werewolf"
-        )
-        likely_villager_reads = sum(
-            1 for r in soft_received
-            if r.get("read") == "likely_villager"
-        )
-
-        score += min(0.06, 0.012 * likely_wolf_reads)
-        score -= min(0.05, 0.010 * likely_villager_reads)
-
+        # Hard result adjustment. Soft reads are already in prior.
+        hard_results = (objective_pack or {}).get("hard_results", [])
+        if not hard_results:
+            hard_results = parsed.get("all_divinations", [])
+        black_count = 0
+        white_count = 0
+        for r in hard_results:
+            if not isinstance(r, dict) or r.get("target") != p:
+                continue
+            if r.get("result") == "werewolf":
+                black_count += 1
+            elif r.get("result") == "human":
+                white_count += 1
+        score += 0.11 * black_count
+        score -= 0.045 * white_count
         if black_count > 0 and white_count > 0:
-            score = max(score, 0.42)
-            score = min(score, 0.82)
+            score = min(0.82, max(0.42, score))
 
-        scores[p] = max(0.01, min(0.99, score))
+        scores[p] = _clamp(score, 0.05, 0.97)
 
-    # Rank calibration: keep weaker than previous version.
-    # Strong rank forcing can hurt if LLM already ranked well.
-    ranked = sorted(players, key=lambda x: scores[x], reverse=True)
-    denom = max(1, len(players) - 1)
-
+    # Mild rank calibration for AP/ranking metrics. Avoid over-forcing villagers into wolves.
+    ranked = sorted([p for p in players if scores.get(p, 0) > 0.011], key=lambda x: scores[x], reverse=True)
     for i, p in enumerate(ranked):
-        rank_prior = 1.0 - i / denom
-        scores[p] = 0.93 * scores[p] + 0.07 * rank_prior
-        scores[p] = max(0.01, min(0.99, scores[p]))
+        if i < ww_count:
+            scores[p] = max(scores[p], 0.32 - 0.02 * i)
+        elif i < ww_count + 3:
+            scores[p] = max(scores[p], 0.15)
+        scores[p] = _clamp(scores[p], 0.05, 0.97)
 
     return {p: round(float(scores[p]), 6) for p in players}

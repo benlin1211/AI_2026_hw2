@@ -15,8 +15,9 @@ class LocalLLM:
         n_ctx: int = 8192,
         n_gpu_layers: int = -1,
         temperature: float = 0.0,
-        max_tokens: int = 2048,
+        max_tokens: int = 512,
     ):
+        self.model_path = model_path
         self.temperature = temperature
         self.max_tokens = max_tokens
         if Llama is None:
@@ -31,8 +32,7 @@ class LocalLLM:
     def _format_qwen_chat(self, user_prompt: str) -> str:
         return (
             "<|im_start|>system\n"
-            "You are a strict JSON generator. "
-            "You must output exactly one valid JSON object and no other text.\n"
+            "You are a strict JSON generator. Output exactly one valid JSON object and no other text.\n"
             "<|im_end|>\n"
             "<|im_start|>user\n"
             f"{user_prompt}\n"
@@ -42,16 +42,14 @@ class LocalLLM:
 
     def generate(self, prompt: str) -> str:
         formatted_prompt = self._format_qwen_chat(prompt)
-
         result = self.llm(
             formatted_prompt,
             max_tokens=self.max_tokens,
             temperature=self.temperature,
             top_p=0.9,
-            repeat_penalty=1.15,
+            repeat_penalty=1.12,
             stop=["<|im_end|>", "<|endoftext|>"],
         )
-
         return result["choices"][0]["text"].strip()
 
     def generate_json(self, prompt: str) -> Dict[str, Any]:
@@ -60,18 +58,14 @@ class LocalLLM:
 
     def generate_json_with_raw(self, prompt: str) -> Tuple[Dict[str, Any], str]:
         text = self.generate(prompt)
-
         try:
             return json.loads(text), text
         except Exception:
             pass
-
         match = re.search(r"\{[\s\S]*\}", text)
         if not match:
             raise ValueError(f"Invalid JSON:\n{text}")
-
         json_text = match.group(0)
-
         try:
             return json.loads(json_text), text
         except Exception as e:

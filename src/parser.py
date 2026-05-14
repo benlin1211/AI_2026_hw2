@@ -69,16 +69,16 @@ def extract_claims_from_messages(messages: List[Dict[str, Any]], players: List[s
     # Only first-person / explicit bracket-style self claims.
     # Do NOT match generic "Seer claim" because that often means discussing someone else's claim.
     seer_pat = re.compile(
-        r"(\[Seer claim\]|\[Seer\]\s*:|"
-        r"\bI'?m a Seer\b|\bI am a Seer\b|\bI am the Seer\b|\bI'?m the Seer\b|"
+        r"(\[Seer claim\]|\[Seer\s*CO\]|\[Seer\]\s*:|\[(?:Me\s*:\s*)?I[’']?m\s+(?:the\s+)?Seer\]|It seems I[’']?m\s+the\s+\[?Seer\]?|I can see the future|my real profession is\s+(?:a\s+)?\[?Seer\]?|"
+        r"\bI[’']?m a Seer\b|\bI am a Seer\b|\bI am the Seer\b|\bI[’']?m the Seer\b|"
         r"\bI claim Seer\b|\bI'?ll claim Seer\b|"
         r"占CO|占いCO|【占】|占いです|占い師CO)",
         re.I,
     )
 
     medium_pat = re.compile(
-        r"(\[Medium claim\]|\[Medium\]\s*:|"
-        r"\bI'?m a Medium\b|\bI am a Medium\b|\bI am the Medium\b|\bI'?m the Medium\b|"
+        r"(\[Medium claim\]|\[Medium\s*CO\]|\[Medium\]\s*:|\[Medium\s+Claim\]|I[’']?ve awakened to my spiritual abilities|"
+        r"\bI[’']?m a Medium\b|\bI am a Medium\b|\bI am the Medium\b|\bI[’']?m the Medium\b|"
         r"\bI claim Medium\b|\bI'?ll claim Medium\b|"
         r"霊CO|霊能CO|霊媒CO|【霊】|霊能者CO)",
         re.I,
@@ -153,9 +153,9 @@ def extract_claims_from_messages(messages: List[Dict[str, Any]], players: List[s
         seer_match = bool(seer_pat.search(text))
         medium_match = bool(medium_pat.search(text))
 
-        if seer_match and not (discussion_only and not re.search(r"(\[Seer claim\]|\[Seer\]\s*:|占CO|占いCO|【占】)", text, re.I)):
+        if seer_match and not (discussion_only and not re.search(r"(\[Seer claim\]|\[Seer\s*CO\]|\[Seer\]\s*:|\[(?:Me\s*:\s*)?I[’']?m\s+(?:the\s+)?Seer\]|It seems I[’']?m\s+the\s+\[?Seer\]?|I can see the future|my real profession is\s+(?:a\s+)?\[?Seer\]?|占CO|占いCO|【占】)", text, re.I)):
             # Avoid contradictory extraction from the same sentence unless there is an explicit bracket claim.
-            if not has_not_both or re.search(r"(\[Seer claim\]|\[Seer\]\s*:|占CO|占いCO|【占】)", text, re.I):
+            if not has_not_both or re.search(r"(\[Seer claim\]|\[Seer\s*CO\]|\[Seer\]\s*:|\[(?:Me\s*:\s*)?I[’']?m\s+(?:the\s+)?Seer\]|It seems I[’']?m\s+the\s+\[?Seer\]?|I can see the future|my real profession is\s+(?:a\s+)?\[?Seer\]?|占CO|占いCO|【占】)", text, re.I):
                 claims[speaker].append({
                     "claim": "Seer CO",
                     "order": msg["no"],
@@ -163,8 +163,8 @@ def extract_claims_from_messages(messages: List[Dict[str, Any]], players: List[s
                     "text": text[:300],
                 })
 
-        if medium_match and not (discussion_only and not re.search(r"(\[Medium claim\]|\[Medium\]\s*:|霊CO|霊能CO|霊媒CO|【霊】)", text, re.I)):
-            if not has_not_both or re.search(r"(\[Medium claim\]|\[Medium\]\s*:|霊CO|霊能CO|霊媒CO|【霊】)", text, re.I):
+        if medium_match and not (discussion_only and not re.search(r"(\[Medium claim\]|\[Medium\s*CO\]|\[Medium\]\s*:|\[Medium\s+Claim\]|I[’']?ve awakened to my spiritual abilities|霊CO|霊能CO|霊媒CO|【霊】)", text, re.I)):
+            if not has_not_both or re.search(r"(\[Medium claim\]|\[Medium\s*CO\]|\[Medium\]\s*:|\[Medium\s+Claim\]|I[’']?ve awakened to my spiritual abilities|霊CO|霊能CO|霊媒CO|【霊】)", text, re.I):
                 claims[speaker].append({
                     "claim": "Medium CO",
                     "order": msg["no"],
@@ -228,6 +228,31 @@ def clean_name(name: str) -> str:
     name = re.sub(r"[\[\]【】「」『』:：].*", "", name)
     name = name.strip()
     return name
+
+
+def canonical_player_name(name: str, players: List[str]) -> str:
+    """Map log speaker names like 'Outlaw Dieter' to role CSV names like 'Dieter'."""
+    raw = str(name or "").strip()
+    if raw in players:
+        return raw
+    low_map = {str(p).strip().lower(): p for p in players}
+    if raw.lower() in low_map:
+        return low_map[raw.lower()]
+    tokens = [x for x in re.split(r"\s+", raw) if x]
+    candidates = []
+    if tokens:
+        candidates.append(tokens[-1].lower())
+        candidates.append(raw.lower())
+    for p in players:
+        plow = str(p).lower()
+        ptoks = [x for x in re.split(r"\s+", str(p)) if x]
+        plast = ptoks[-1].lower() if ptoks else plow
+        if plast in candidates or plow.endswith(" " + tokens[-1].lower() if tokens else "\0"):
+            return p
+        # title-only or short-name CSV variants
+        if tokens and tokens[-1].lower() == plow:
+            return p
+    return raw
 
 
 def extract_claims(day_text: str, players: List[str]) -> Dict[str, List[str]]:
@@ -325,63 +350,101 @@ def extract_divinations_from_messages(
 
 def extract_soft_reads(day_text: str, players: List[str]) -> List[Dict[str, str]]:
     """
-    Extract soft social reads:
-    white = likely villager
-    black = likely werewolf
-    gray = unresolved
-
-    These are not divination results.
-    They should affect wolf_score weakly, not role truth directly.
+    Message-level soft read extraction.  This replaces the old day-level regex,
+    which connected survivor lists / GS tables / quoted blocks to the wrong
+    speakers and targets.
     """
-    reads = []
+    reads: List[Dict[str, str]] = []
+    messages = parse_messages(day_text)
+    if not messages:
+        return []
 
     read_words = {
-        "white": "likely_villager",
         "white-ish": "likely_villager",
-        "black": "likely_werewolf",
         "black-ish": "likely_werewolf",
+        "white": "likely_villager",
+        "black": "likely_werewolf",
         "gray": "unresolved",
         "grey": "unresolved",
     }
 
-    for speaker in players:
-        for target in players:
-            if speaker == target:
+    def aliases(player: str) -> List[str]:
+        parts = [x for x in re.split(r"\s+", player) if x]
+        out = [player]
+        if parts and len(parts[-1]) >= 3:
+            out.append(parts[-1])
+        low = player.lower()
+        extra = {
+            "shepherd": ["Sheep"], "baker": ["Baker", "Inn", "Innkeeper"],
+            "father": ["Father", "God"], "librarian": ["Librarian", "Book"],
+            "wounded soldier": ["Soldier"], "young girl": ["Girl"],
+            "young man": ["Young Man", "Blue"], "old man": ["Old Man", "Old"],
+            "farmer": ["Farmer"], "merchant": ["Merchant"], "mayor": ["Mayor"],
+            "traveler": ["Traveler"], "outlaw": ["Outlaw"], "tailor": ["Tailor"],
+        }
+        for key, vals in extra.items():
+            if key in low:
+                out.extend(vals)
+        return list(dict.fromkeys(out))
+
+    skip_context = re.compile(
+        r"current survivors|survivors are|\bGS\b|gray scale|white\s+.+>.+black|"
+        r"confirmed seer result|was found in a gruesome state|formation|current situation|"
+        r"\[.*Seer.*\]|\[.*Medium.*\]",
+        re.I | re.S,
+    )
+
+    for msg in messages:
+        speaker = canonical_player_name(msg.get("speaker"), players)
+        text = str(msg.get("text", ""))
+        if speaker not in players:
+            continue
+        # Skip summaries, tables, CO/result posts, and very broad posts mentioning many players.
+        if skip_context.search(text):
+            continue
+        mentioned_count = 0
+        for p in players:
+            if p == speaker:
                 continue
+            if any(re.search(rf"(?<![A-Za-z]){re.escape(a)}(?![A-Za-z])", text, re.I) for a in aliases(p)):
+                mentioned_count += 1
+        if mentioned_count > 5:
+            continue
 
+        for target in players:
+            if target == speaker:
+                continue
+            target_pats = [rf"(?<![A-Za-z]){re.escape(a)}(?![A-Za-z])" for a in aliases(target) if len(a) >= 3]
+            if not target_pats:
+                continue
+            target_union = "(?:" + "|".join(target_pats) + ")"
             patterns = [
-                rf"{re.escape(speaker)}[\s\S]{{0,300}}{re.escape(target)}[\s\S]{{0,80}}\b(white-ish|black-ish|white|black|gray|grey)\b",
-                rf"{re.escape(speaker)}[\s\S]{{0,300}}\b(white-ish|black-ish|white|black|gray|grey)\b[\s\S]{{0,80}}{re.escape(target)}",
+                rf"{target_union}[^\n]{{0,80}}\b(white-ish|black-ish|white|black|gray|grey)\b",
+                rf"\b(white-ish|black-ish|white|black|gray|grey)\b[^\n]{{0,80}}{target_union}",
             ]
-
             for pat in patterns:
-                for m in re.finditer(pat, day_text, re.I):
-                    word = None
-                    for g in m.groups():
-                        if g and g.lower() in read_words:
-                            word = g.lower()
-                            break
+                m = re.search(pat, text, re.I)
+                if not m:
+                    continue
+                word = next((g.lower() for g in m.groups() if g and g.lower() in read_words), None)
+                if not word:
+                    continue
+                reads.append({
+                    "speaker": speaker,
+                    "target": target,
+                    "read": read_words[word],
+                    "raw_word": word,
+                    "evidence_type": "soft_read",
+                    "text": text[max(0, m.start() - 80): min(len(text), m.end() + 80)],
+                })
+                break
 
-                    if word:
-                        reads.append({
-                            "speaker": speaker,
-                            "target": target,
-                            "read": read_words[word],
-                            "raw_word": word,
-                            "evidence_type": "soft_read",
-                            "text": day_text[max(0, m.start() - 80): min(len(day_text), m.end() + 80)],
-                        })
-
-    seen = set()
-    unique = []
+    seen = set(); unique = []
     for r in reads:
-        key = (r["speaker"], r["target"], r["read"], r["raw_word"])
+        key = (r["speaker"], r["target"], r["read"], r["raw_word"], r["text"][:80])
         if key not in seen:
-            seen.add(key)
-            unique.append(r)
-
+            seen.add(key); unique.append(r)
     return unique
-
 
 def extract_votes(day_text: str, players: List[str]) -> List[Dict[str, str]]:
     """
@@ -455,6 +518,8 @@ def parse_game_log(text: str, players: List[str]) -> Dict[str, Any]:
 
     for day, content in days.items():
         messages = parse_messages(content)
+        for _m in messages:
+            _m["speaker"] = canonical_player_name(_m.get("speaker", ""), players)
 
         # fallback: if parser fails, keep old behavior
         if messages:
@@ -909,33 +974,197 @@ def build_daily_states(parsed: Dict[str, Any], players: List[str]) -> Dict[str, 
         }
 
     return states
+# =========================
+# MaKTO-inspired v2 helpers
+# =========================
 
-def chunk_messages_by_day(parsed: Dict[str, Any], chunk_size: int = 100, overlap: int = 12) -> Dict[str, List[List[Dict[str, Any]]]]:
+STRATEGIC_KEYWORDS = [
+    "Seer", "Medium", "claim", "CO", "counter", "fake", "true", "real",
+    "not Seer", "not Medium", "not Seer / not Medium",
+    "result", "verdict", "divination", "divined", "checked", "check",
+    "white", "black", "gray", "grey", "wolf", "werewolf", "human", "villager",
+    "suspicious", "suspect", "doubt", "distrust", "trust", "believe", "defend",
+    "vote", "lynch", "execute", "execution", "rope", "line", "formation",
+    "●", "○", "▼", "▽",
+    "占", "霊", "靈", "判定", "結果", "白", "黒", "黑", "狼", "人狼", "吊", "希望",
+]
+
+
+def _is_game_day(day: Any) -> bool:
+    s = str(day)
+    return s.isdigit() and int(s) >= 1
+
+
+def _shorten_text(text: str, n: int = 260) -> str:
+    text = str(text or "").replace("\r", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text[:n]
+
+
+def _has_any_keyword(text: str, keywords: List[str] = None) -> bool:
+    keywords = keywords or STRATEGIC_KEYWORDS
+    low = str(text or "").lower()
+    return any(str(k).lower() in low for k in keywords)
+
+
+def build_objective_pack(parsed: Dict[str, Any], players: List[str]) -> Dict[str, Any]:
     """
-    Build message chunks for LLM extraction.
-    The chunking follows the proposal: process day-by-day and avoid sending full logs at once.
+    Build a compact, Day1+ only objective pack.
+
+    This deliberately excludes prologue messages because private/public logs contain
+    many RP fake-COs and Gerd jokes before the real game starts.
     """
-    out: Dict[str, List[List[Dict[str, Any]]]] = {}
-    step = max(1, chunk_size - max(0, overlap))
+    role_counts = get_role_counts(len(players))
+
+    claim_timeline: List[Dict[str, Any]] = []
+    hard_results: List[Dict[str, Any]] = []
+    votes: List[Dict[str, Any]] = []
+    deaths: List[Dict[str, Any]] = []
+    soft_reads: List[Dict[str, Any]] = []
 
     for day in _sort_days(parsed.get("days", {})):
-        messages = parsed["days"][day].get("messages", [])
-        normalized = []
-        for m in messages:
-            item = dict(m)
-            item["day"] = day
-            normalized.append(item)
-
-        if not normalized:
-            out[day] = []
+        if not _is_game_day(day):
             continue
+        day_obj = parsed["days"].get(day, {})
 
-        chunks = []
-        for start in range(0, len(normalized), step):
-            chunk = normalized[start:start + chunk_size]
-            if chunk:
-                chunks.append(chunk)
-            if start + chunk_size >= len(normalized):
+        for player, claims in day_obj.get("claims", {}).items():
+            if player not in players:
+                continue
+            for c in claims:
+                if isinstance(c, dict):
+                    claim = str(c.get("claim", ""))
+                    order = c.get("order")
+                    time = c.get("time")
+                    text = _shorten_text(c.get("text", ""), 180)
+                else:
+                    claim = str(c)
+                    order = None
+                    time = None
+                    text = ""
+                claim_timeline.append({
+                    "day": str(day),
+                    "order": order,
+                    "time": time,
+                    "player": player,
+                    "claim": claim,
+                    "text": text,
+                })
+
+        for r in day_obj.get("divinations", []):
+            if not isinstance(r, dict):
+                continue
+            item = dict(r)
+            item["day"] = str(day)
+            item["text"] = _shorten_text(item.get("text", ""), 180)
+            hard_results.append(item)
+
+        for v in day_obj.get("votes", []):
+            if not isinstance(v, dict):
+                continue
+            item = dict(v)
+            item["day"] = str(day)
+            item["text"] = _shorten_text(item.get("text", ""), 160)
+            votes.append(item)
+
+        for d in day_obj.get("deaths", []):
+            if d in players:
+                deaths.append({"day": str(day), "player": d, "cause": "death_or_attack"})
+
+        # Keep soft reads compact; these are weak features for interaction, not hard results.
+        for r in day_obj.get("soft_reads", [])[:120]:
+            if not isinstance(r, dict):
+                continue
+            item = {
+                "day": str(day),
+                "speaker": r.get("speaker"),
+                "target": r.get("target"),
+                "read": r.get("read"),
+                "raw_word": r.get("raw_word"),
+                "text": _shorten_text(r.get("text", ""), 120),
+            }
+            if item["speaker"] in players and item["target"] in players:
+                soft_reads.append(item)
+
+    claim_timeline.sort(key=lambda x: (int(x.get("day", "999")) if str(x.get("day", "")).isdigit() else 999, x.get("order") or 10**9))
+
+    seer_claimers = _unique_keep_order([x["player"] for x in claim_timeline if x.get("claim") == "Seer CO"])
+    medium_claimers = _unique_keep_order([x["player"] for x in claim_timeline if x.get("claim") == "Medium CO"])
+    hunter_claimers = _unique_keep_order([x["player"] for x in claim_timeline if "Hunter" in str(x.get("claim", ""))])
+    not_seer_medium = _unique_keep_order([
+        x["player"] for x in claim_timeline
+        if x.get("claim") == "Not Seer/Medium"
+        or x.get("claim") == "Not Seer"
+        or x.get("claim") == "Not Medium"
+    ])
+
+    ability_claimers = set(seer_claimers) | set(medium_claimers) | set(hunter_claimers)
+    gray_players = [p for p in players if p not in ability_claimers and p not in {d.get("player") for d in deaths}]
+
+    latest_day = None
+    for day in _sort_days(parsed.get("days", {})):
+        if _is_game_day(day):
+            latest_day = str(day)
+
+    return {
+        "num_players": len(players),
+        "role_counts": role_counts,
+        "latest_day": latest_day,
+        "formation": f"{len(seer_claimers)}-{len(medium_claimers)}",
+        "seer_claimers": seer_claimers,
+        "medium_claimers": medium_claimers,
+        "hunter_claimers": hunter_claimers,
+        "not_seer_medium_claimers": not_seer_medium,
+        "gray_players": gray_players,
+        "claim_timeline": claim_timeline[:80],
+        "hard_results": hard_results[:120],
+        "votes": votes[:180],
+        "deaths": deaths,
+        "soft_reads": soft_reads[:160],
+        "notes": [
+            "Objective pack is Day1+ only; prologue RP is excluded.",
+            "Soft reads are not hard Seer/Medium results.",
+            "Madman is not Werewolf for wolf_score.",
+        ],
+    }
+
+
+def build_strategic_snippets(parsed: Dict[str, Any], players: List[str], max_per_day: int = 90, max_total: int = 420) -> List[Dict[str, Any]]:
+    """
+    Day1+ only snippets for interaction analysis.
+    Keeps language actions, not the entire log.
+    """
+    snippets: List[Dict[str, Any]] = []
+
+    for day in _sort_days(parsed.get("days", {})):
+        if not _is_game_day(day):
+            continue
+        day_obj = parsed["days"].get(day, {})
+        kept_for_day = 0
+
+        for msg in day_obj.get("messages", []):
+            if kept_for_day >= max_per_day:
                 break
-        out[day] = chunks
-    return out
+            speaker = msg.get("speaker")
+            text = str(msg.get("text", ""))
+            if speaker not in players:
+                continue
+            if not _has_any_keyword(text):
+                continue
+
+            snippets.append({
+                "day": str(day),
+                "order": msg.get("no"),
+                "time": msg.get("time"),
+                "speaker": speaker,
+                "text": _shorten_text(text, 360),
+            })
+            kept_for_day += 1
+
+    # Prefer early formation/claim messages and later high-signal messages.
+    snippets.sort(key=lambda x: (int(x.get("day", "999")) if str(x.get("day", "")).isdigit() else 999, x.get("order") or 10**9))
+    if len(snippets) <= max_total:
+        return snippets
+
+    head = snippets[: max_total // 2]
+    tail = snippets[-(max_total - len(head)):]
+    return head + tail
